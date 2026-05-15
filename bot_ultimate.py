@@ -1,4 +1,4 @@
-import os, json, logging, io, base64, tempfile, asyncio, re
+import os, json, logging, io, base64, re
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -244,25 +244,20 @@ def db_set_state(user_id, field, value):
         conn.close()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
-# Google Drive + Speech
+# Google Drive
 # ━━━━━━━━━━━━━━━━━━━━━━━
 drive_service = None
-speech_service = None
 
 if GOOGLE_CREDENTIALS_JSON:
     try:
         creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
         sa_creds = service_account.Credentials.from_service_account_info(
-            creds_dict, scopes=[
-                "https://www.googleapis.com/auth/drive.readonly",
-                "https://www.googleapis.com/auth/cloud-platform",
-            ]
+            creds_dict, scopes=["https://www.googleapis.com/auth/drive.readonly"]
         )
         drive_service = build("drive", "v3", credentials=sa_creds)
-        speech_service = build("speech", "v1", credentials=sa_creds)
-        logger.info("Drive + Speech connected!")
+        logger.info("Drive connected!")
     except Exception as e:
-        logger.error(f"Drive/Speech error: {e}")
+        logger.error(f"Drive error: {e}")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
 # Gmail
@@ -297,7 +292,8 @@ def search_drive_files(query_text, max_results=10):
     if not drive_service:
         return []
     try:
-        q = f"name contains '{query_text}' and trashed = false"
+        safe = query_text.replace("\\", "\\\\").replace("'", "\\'")
+        q = f"name contains '{safe}' and trashed = false"
         r = drive_service.files().list(
             q=q, pageSize=max_results,
             fields="files(id, name, mimeType, modifiedTime)",
@@ -600,7 +596,7 @@ async def ask_claude(user_id, message):
         txt = "\n".join(text_parts) if text_parts else "응답 없음"
         db_add_message(user_id, "assistant", txt)
         return txt
-    except anthropic.APIError as e:
+    except Exception as e:
         logger.error(f"Claude error: {e}")
         return "AI 오류. 잠시 후 다시 시도하세요."
 
