@@ -42,7 +42,7 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 MAX_HISTORY = 20
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
-# PostgreSQL 연결 & 테이블 초기화
+# PostgreSQL
 # ━━━━━━━━━━━━━━━━━━━━━━━
 def get_db():
     if not DATABASE_URL:
@@ -62,18 +62,16 @@ def init_db():
         return False
     try:
         cur = conn.cursor()
-        # 대화 기록
         cur.execute("""
             CREATE TABLE IF NOT EXISTS conversation_history (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
                 role TEXT NOT NULL,
-                content JSONB NOT NULL,
+                content TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             );
             CREATE INDEX IF NOT EXISTS idx_conv_user ON conversation_history(user_id);
         """)
-        # 유저 상태 (검색결과, 메일목록, 마지막작업)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_state (
                 user_id BIGINT PRIMARY KEY,
@@ -82,7 +80,6 @@ def init_db():
                 last_action JSONB DEFAULT '{}'
             );
         """)
-        # 메모
         cur.execute("""
             CREATE TABLE IF NOT EXISTS memos (
                 id SERIAL PRIMARY KEY,
@@ -93,14 +90,14 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_memo_user ON memos(user_id);
         """)
         conn.close()
-        logger.info("✅ DB tables initialized!")
+        logger.info("DB tables initialized!")
         return True
     except Exception as e:
         logger.error(f"DB init error: {e}")
         conn.close()
         return False
 
-# 메모리 fallback (DB 없을 때)
+# 메모리 fallback
 _mem_history = defaultdict(list)
 _mem_search = defaultdict(list)
 _mem_gmail = defaultdict(list)
@@ -108,7 +105,7 @@ _mem_action = defaultdict(dict)
 db_available = False
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
-# DB 헬퍼 함수
+# DB 헬퍼
 # ━━━━━━━━━━━━━━━━━━━━━━━
 def db_get_history(user_id):
     if not db_available:
@@ -119,18 +116,19 @@ def db_get_history(user_id):
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT role, content FROM conversation_history WHERE user_id=%s ORDER BY id",
-            (user_id,)
+            "SELECT role, content FROM conversation_history WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+            (user_id, MAX_HISTORY)
         )
         rows = cur.fetchall()
         conn.close()
+        rows.reverse()
         return [{"role": r[0], "content": r[1]} for r in rows]
     except Exception as e:
         logger.error(f"db_get_history: {e}")
         conn.close()
         return []
 
-def (user_id, role, content):
+def db_add_message(user_id, role, content):
     if not db_available:
         _mem_history[user_id].append({"role": role, "content": content})
         if len(_mem_history[user_id]) > MAX_HISTORY:
@@ -141,16 +139,9 @@ def (user_id, role, content):
         return
     try:
         cur = conn.cursor()
-        # MAX_HISTORY 초과 시 오래된 것 삭제
-        cur.execute("""
-            DELETE FROM conversation_history WHERE user_id=%s AND id IN (
-                SELECT id FROM conversation_history WHERE user_id=%s
-                ORDER BY id DESC OFFSET %s
-            )
-        """, (user_id, user_id, MAX_HISTORY))
         cur.execute(
             "INSERT INTO conversation_history (user_id, role, content) VALUES (%s, %s, %s)",
-            (user_id, role, Json(content))
+            (user_id, role, content)
         )
         conn.close()
     except Exception as e:
@@ -170,10 +161,11 @@ def db_clear_history(user_id):
     try:
         cur = conn.cursor()
         cur.execute("DELETE FROM conversation_history WHERE user_id=%s", (user_id,))
-        cur.execute(
-            "INSERT INTO user_state (user_id) VALUES (%s) ON CONFLICT (user_id) DO UPDATE SET search_results='[]', gmail_list='[]', last_action='{}'",
-            (user_id,)
-        )
+        cur.execute("""
+            INSERT INTO user_state (user_id) VALUES (%s)
+            ON CONFLICT (user_id) DO UPDATE
+            SET search_results='[]', gmail_list='[]', last_action='{}'
+        """, (user_id,))
         conn.close()
     except Exception as e:
         logger.error(f"db_clear_history: {e}")
@@ -181,9 +173,12 @@ def db_clear_history(user_id):
 
 def db_get_state(user_id, field):
     if not db_available:
-        if field == "search_results": return list(_mem_search[user_id])
-        if field == "gmail_list": return list(_mem_gmail[user_id])
-        if field == "last_action": return dict(_mem_action[user_id])
+        if field == "search_results":
+            return list(_mem_search[user_id])
+        if field == "gmail_list":
+            return list(_mem_gmail[user_id])
+        if field == "last_action":
+            return dict(_mem_action[user_id])
         return None
     conn = get_db()
     if not conn:
@@ -203,9 +198,12 @@ def db_get_state(user_id, field):
 
 def db_set_state(user_id, field, value):
     if not db_available:
-        if field == "search_results": _mem_search[user_id] = value
-        elif field == "gmail_list": _mem_gmail[user_id] = value
-        elif field == "last_action": _mem_action[user_id] = value
+        if field == "search_results":
+            _mem_search[user_id] = value
+        elif field == "gmail_list":
+            _mem_gmail[user_id] = value
+        elif field == "last_action":
+            _mem_action[user_id] = value
         return
     conn = get_db()
     if not conn:
@@ -472,31 +470,25 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
 SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 텔레그램으로 소통하며 실제 비서처럼 판단하고 행동합니다.
 
-━━━━━━━━━━━━━━━━━━━━━━━
-🧠 핵심 원칙
-━━━━━━━━━━━━━━━━━━━━━━━
+핵심 원칙:
 - 항상 대표님 입장에서 가장 빠르고 편한 방법으로 처리
 - 호칭은 보스 라고 부르기
 - 짧고 명확하게. 불필요한 말 절대 금지
 - 모호하면 한 가지만 물어보고 바로 처리
 - 실패해도 이유를 한 줄로만 설명하고 대안 제시
-- "죄송합니다" 남발 금지. 대신 바로 해결책 제시
+- 죄송합니다 남발 금지. 대신 바로 해결책 제시
 - 존댓말 유지, 친근하되 전문적으로
 
-━━━━━━━━━━━━━━━━━━━━━━━
-🛠️ 보유 기능
-━━━━━━━━━━━━━━━━━━━━━━━
+보유 기능:
 1. Google Drive - 파일 검색, 전송
 2. Gmail - 전송, 파일 첨부, 받은 메일 읽기/검색/요약
 3. 음성/통화녹음 - m4a, mp3 등 자동 텍스트 변환 + AI 요약
 4. 웹 검색 - 실시간 뉴스, 날씨, 주가, 인물, 기업 정보
 5. 문서 작성 - 이메일 초안, 보고서, 아이디어 정리
-6. 메모 저장 - 중요한 내용 저장 및 조회 (DB 영구 보관)
+6. 메모 저장 - 중요한 내용 저장 및 조회
 7. 일반 대화 및 업무 조언
 
-━━━━━━━━━━━━━━━━━━━━━━━
-📋 명령 형식
-━━━━━━━━━━━━━━━━━━━━━━━
+명령 형식:
 [DRIVE_SEARCH:검색어]
 [DRIVE_LIST]
 [DRIVE_SEND:번호]
@@ -508,55 +500,29 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 [MEMO_LIST]
 [REPEAT_LAST]
 
-━━━━━━━━━━━━━━━━━━━━━━━
-📁 파일 처리 규칙
-━━━━━━━━━━━━━━━━━━━━━━━
-검색 트리거: "찾아줘", "어딨어", "검색해", "있어?" → [DRIVE_SEARCH:핵심단어]
-전송 트리거: "줘", "보내줘", "전송해", "받고싶어" → [DRIVE_SEND:1]
-번호 지정: "2번", "두번째" → 해당 번호로 처리
-결과 1개면 → 바로 [DRIVE_SEND:1] (확인 없이)
+파일 처리:
+검색 트리거: 찾아줘, 어딨어, 검색해, 있어? -> [DRIVE_SEARCH:핵심단어]
+전송 트리거: 줘, 보내줘, 전송해 -> [DRIVE_SEND:1]
 
-━━━━━━━━━━━━━━━━━━━━━━━
-📧 이메일 전송 규칙
-━━━━━━━━━━━━━━━━━━━━━━━
+이메일:
 주소 없을 때: 반드시 먼저 물어보기
-주소 있을 때: 제목/본문이 없어도 문맥에서 추론해서 작성
-파일 첨부: "파일도 같이", "첨부해서" → [EMAIL_WITH_FILE] 사용
+파일 첨부: 파일도 같이, 첨부해서 -> [EMAIL_WITH_FILE] 사용
 
-━━━━━━━━━━━━━━━━━━━━━━━
-📬 메일 읽기 규칙
-━━━━━━━━━━━━━━━━━━━━━━━
-"메일 확인", "받은 메일" → [GMAIL_LIST:is:unread]
-"오늘 온 메일" → [GMAIL_LIST:newer_than:1d]
-"○○한테서 온 메일" → [GMAIL_LIST:from:○○]
-목록 표시 후 "1번 읽어줘" → [GMAIL_READ:1]
+메일 읽기:
+메일 확인, 받은 메일 -> [GMAIL_LIST:is:unread]
+오늘 온 메일 -> [GMAIL_LIST:newer_than:1d]
+목록 표시 후 1번 읽어줘 -> [GMAIL_READ:1]
 
-━━━━━━━━━━━━━━━━━━━━━━━
-📝 메모 규칙
-━━━━━━━━━━━━━━━━━━━━━━━
-"메모해줘", "기억해줘", "저장해줘" → [MEMO_SAVE:내용]
-"메모 뭐 있어", "저장된 거 보여줘" → [MEMO_LIST]
+메모:
+메모해줘, 기억해줘, 저장해줘 -> [MEMO_SAVE:내용]
+메모 뭐 있어 -> [MEMO_LIST]
 
-━━━━━━━━━━━━━━━━━━━━━━━
-🔍 웹 검색 규칙
-━━━━━━━━━━━━━━━━━━━━━━━
-자동 검색: 오늘/최신 뉴스, 날씨, 주가, 환율, 모르는 사람/기업/장소
+웹 검색:
+자동 검색: 오늘/최신 뉴스, 날씨, 주가, 환율, 모르는 사람/기업
 결과: 핵심 3줄 요약 + 출처 1개
 
-━━━━━━━━━━━━━━━━━━━━━━━
-🔄 반복 / 맥락 규칙
-━━━━━━━━━━━━━━━━━━━━━━━
-"다시", "또", "한번 더" → [REPEAT_LAST]
-"그거", "이거", "아까 말한 거" → 직전 대화 참조
-
-━━━━━━━━━━━━━━━━━━━━━━━
-🚫 절대 금지
-━━━━━━━━━━━━━━━━━━━━━━━
-- 같은 설명 반복
-- 할 수 없는 것을 할 수 있다고 대답
-- 불필요한 긴 답변
-- "죄송합니다" 남발
-- 확인되지 않은 정보를 사실처럼 말하기"""
+반복:
+다시, 또, 한번 더 -> [REPEAT_LAST]"""
 
 
 def is_authorized(uid):
@@ -568,10 +534,10 @@ def is_authorized(uid):
 # ━━━━━━━━━━━━━━━━━━━━━━━
 async def ask_claude(user_id, message):
     history = db_get_history(user_id)
-    new_msg = {"role": "user", "content": f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}]\n{message}"}
-    db_add_message(user_id, "user", new_msg["content"])
-
-    history.append(new_msg)
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+    user_content = f"[{timestamp}]\n{message}"
+    db_add_message(user_id, "user", user_content)
+    history.append({"role": "user", "content": user_content})
 
     try:
         r = client.messages.create(
@@ -583,12 +549,11 @@ async def ask_claude(user_id, message):
         )
         text_parts = [block.text for block in r.content if block.type == "text"]
         txt = "\n".join(text_parts) if text_parts else "응답 없음"
-
         db_add_message(user_id, "assistant", txt)
         return txt
     except anthropic.APIError as e:
         logger.error(f"Claude error: {e}")
-        return "⚠️ AI 오류. 잠시 후 다시 시도하세요."
+        return "AI 오류. 잠시 후 다시 시도하세요."
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
@@ -602,7 +567,7 @@ async def cmd_start(update, context):
     d = "✅" if drive_service else "❌"
     g = "✅" if gmail_service else "❌"
     s = "✅" if speech_service else "❌"
-    db = "✅" if db_available else "⚠️ 메모리"
+    db = "✅" if db_available else "메모리"
     await update.message.reply_text(
         f"보스, 안녕하세요! 👋\n\n"
         f"📁 Drive: {d} 📧 Gmail: {g} 🎙️ 음성: {s}\n"
@@ -616,53 +581,57 @@ async def cmd_start(update, context):
 
 async def cmd_clear(update, context):
     uid = update.effective_user.id
-    if not is_authorized(uid): return
+    if not is_authorized(uid):
+        return
     db_clear_history(uid)
-    await update.message.reply_text("🗑️ 대화 기록 초기화 완료!")
+    await update.message.reply_text("대화 기록 초기화 완료!")
 
 async def cmd_files(update, context):
     uid = update.effective_user.id
-    if not is_authorized(uid): return
+    if not is_authorized(uid):
+        return
     if not drive_service:
-        await update.message.reply_text("❌ Drive 미연결")
+        await update.message.reply_text("Drive 미연결")
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     files = list_drive_files()
     if not files:
-        await update.message.reply_text("📁 파일 없음")
+        await update.message.reply_text("파일 없음")
         return
     db_set_state(uid, "search_results", files)
     msg = "📁 최근 파일 목록:\n\n"
     for i, f in enumerate(files, 1):
-        msg += f"{i}. 📄 {f['name']} ({f.get('modifiedTime','')[:10]})\n"
-    msg += "\n💡 번호로 전송/이메일 첨부 가능!"
+        msg += f"{i}. {f['name']} ({f.get('modifiedTime','')[:10]})\n"
+    msg += "\n번호로 전송/이메일 첨부 가능!"
     await update.message.reply_text(msg)
 
 async def cmd_mail(update, context):
     uid = update.effective_user.id
-    if not is_authorized(uid): return
+    if not is_authorized(uid):
+        return
     if not gmail_service:
-        await update.message.reply_text("❌ Gmail 미연결")
+        await update.message.reply_text("Gmail 미연결")
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     emails = get_gmail_list(10, "is:unread")
     if not emails:
-        await update.message.reply_text("📭 읽지 않은 메일 없음")
+        await update.message.reply_text("읽지 않은 메일 없음")
         return
     db_set_state(uid, "gmail_list", emails)
     msg = "📬 읽지 않은 메일:\n\n"
     for i, e in enumerate(emails, 1):
         sender = e["from"].split("<")[0].strip()[:20]
         subject = e["subject"][:30]
-        msg += f"{i}. 👤 {sender}\n 📌 {subject}\n\n"
-    msg += "💡 '1번 메일 읽어줘'라고 하세요!"
+        msg += f"{i}. {sender}\n   {subject}\n\n"
+    msg += "1번 메일 읽어줘 라고 하세요!"
     await update.message.reply_text(msg)
 
 async def cmd_memo(update, context):
     uid = update.effective_user.id
-    if not is_authorized(uid): return
+    if not is_authorized(uid):
+        return
     if not db_available:
-        await update.message.reply_text("❌ DB 미연결 — 메모 기능 사용 불가")
+        await update.message.reply_text("DB 미연결")
         return
     conn = get_db()
     if not conn:
@@ -670,35 +639,34 @@ async def cmd_memo(update, context):
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, content, created_at FROM memos WHERE user_id=%s ORDER BY id DESC LIMIT 10",
+            "SELECT content, created_at FROM memos WHERE user_id=%s ORDER BY id DESC LIMIT 10",
             (uid,)
         )
         rows = cur.fetchall()
         conn.close()
         if not rows:
-            await update.message.reply_text("📝 저장된 메모 없음")
+            await update.message.reply_text("저장된 메모 없음")
             return
         msg = "📝 저장된 메모:\n\n"
         for r in rows:
-            dt = r[2].strftime("%m/%d %H:%M") if r[2] else ""
-            msg += f"[{dt}] {r[1]}\n\n"
+            dt = r[1].strftime("%m/%d %H:%M") if r[1] else ""
+            msg += f"[{dt}] {r[0]}\n\n"
         await update.message.reply_text(msg)
     except Exception as e:
         logger.error(f"cmd_memo error: {e}")
-        await update.message.reply_text("❌ 메모 조회 실패")
+        await update.message.reply_text("메모 조회 실패")
 
 async def cmd_help(update, context):
-    if not is_authorized(update.effective_user.id): return
+    if not is_authorized(update.effective_user.id):
+        return
     await update.message.reply_text(
         "📖 사용 가이드\n\n"
-        "💬 대화: 메시지 보내면 AI 답변\n\n"
-        "🔍 검색: '오늘 뉴스', '코스피' 등 실시간 검색\n\n"
-        "📁 파일:\n- '파일 찾아줘 [이름]'\n- '보내줘'\n- /files\n\n"
-        "📧 이메일:\n- 'abc@gmail.com에 안녕 보내줘'\n- '1번 파일 메일로 보내줘'\n\n"
-        "📬 메일 읽기:\n- /mail 또는 '받은 메일 보여줘'\n- '1번 메일 읽어줘'\n\n"
-        "📝 메모:\n- '메모해줘 [내용]'\n- /memo 또는 '메모 보여줘'\n\n"
-        "🎙️ 음성: 음성메시지/m4a/mp3 보내면 자동 분석\n\n"
-        "🔄 다시 보내기: '다시', '또 보내줘'\n\n"
+        "파일: '파일 찾아줘 [이름]' / '보내줘' / /files\n\n"
+        "이메일: 'abc@gmail.com에 안녕 보내줘'\n\n"
+        "메일 읽기: /mail 또는 '받은 메일 보여줘'\n\n"
+        "메모: '메모해줘 [내용]' / /memo\n\n"
+        "음성: 음성메시지/m4a/mp3 보내면 자동 분석\n\n"
+        "검색: '오늘 뉴스', '코스피' 등\n\n"
         "/clear - 대화 초기화"
     )
 
@@ -707,9 +675,10 @@ async def cmd_help(update, context):
 # ━━━━━━━━━━━━━━━━━━━━━━━
 async def handle_voice(update, context):
     u = update.effective_user
-    if not is_authorized(u.id): return
+    if not is_authorized(u.id):
+        return
     if not speech_service:
-        await update.message.reply_text("❌ 음성 분석 미연결")
+        await update.message.reply_text("음성 분석 미연결")
         return
     await update.message.reply_text("🎙️ 음성 분석 중...")
     voice = update.message.voice or update.message.audio
@@ -723,17 +692,18 @@ async def handle_voice(update, context):
             for i in range(0, len(analysis), 4096):
                 await update.message.reply_text(analysis[i:i+4096])
         else:
-            await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
+            await update.message.reply_text(f"분석:\n\n{analysis}")
     else:
-        await update.message.reply_text("❌ 음성 인식 실패")
+        await update.message.reply_text("음성 인식 실패")
 
 async def handle_audio_file(update, context):
     u = update.effective_user
-    if not is_authorized(u.id): return
-    if not speech_service:
-        await update.message.reply_text("❌ 음성 분석 미연결")
+    if not is_authorized(u.id):
         return
-    await update.message.reply_text("🎙️ 오디오 분석 중... (잠시 기다려주세요)")
+    if not speech_service:
+        await update.message.reply_text("음성 분석 미연결")
+        return
+    await update.message.reply_text("🎙️ 오디오 분석 중...")
     audio = update.message.audio or update.message.document
     f = await context.bot.get_file(audio.file_id)
     data = await f.download_as_bytearray()
@@ -750,9 +720,9 @@ async def handle_audio_file(update, context):
             for i in range(0, len(analysis), 4096):
                 await update.message.reply_text(analysis[i:i+4096])
         else:
-            await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
+            await update.message.reply_text(f"분석:\n\n{analysis}")
     else:
-        await update.message.reply_text("❌ 음성 인식 실패")
+        await update.message.reply_text("음성 인식 실패")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
 # 메인 메시지 핸들러
@@ -765,20 +735,19 @@ async def handle_message(update, context):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     resp = await ask_claude(u.id, update.message.text)
 
-    # ── 반복 작업
     if "[REPEAT_LAST]" in resp:
         last = db_get_state(u.id, "last_action")
         if not last:
-            await update.message.reply_text("❌ 반복할 이전 작업이 없습니다.")
+            await update.message.reply_text("반복할 이전 작업이 없습니다.")
             return
         if last.get("type") == "file":
-            await update.message.reply_text(f"📤 '{last['name']}' 다시 전송 중...")
+            await update.message.reply_text(f"'{last['name']}' 다시 전송 중...")
             buf, name = download_drive_file(last["file_id"])
             if buf:
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
-                await update.message.reply_document(document=buf, filename=name, caption=f"📄 {name}")
+                await update.message.reply_document(document=buf, filename=name, caption=name)
         elif last.get("type") == "email":
-            await update.message.reply_text(f"📧 {last['to']}로 다시 전송 중...")
+            await update.message.reply_text(f"{last['to']}로 다시 전송 중...")
             buf, fname = None, None
             if last.get("file_id"):
                 buf, fname = download_drive_file(last["file_id"])
@@ -786,10 +755,9 @@ async def handle_message(update, context):
             if ok:
                 await update.message.reply_text(f"✅ {last['to']}로 전송 완료!")
             else:
-                await update.message.reply_text(f"❌ 전송 실패: {msg}")
+                await update.message.reply_text(f"전송 실패: {msg}")
         return
 
-    # ── Drive 검색
     if "[DRIVE_SEARCH:" in resp:
         kw = resp.split("[DRIVE_SEARCH:")[1].split("]")[0]
         files = search_drive_files(kw)
@@ -797,11 +765,11 @@ async def handle_message(update, context):
             db_set_state(u.id, "search_results", files)
             msg = f"🔍 '{kw}' 검색 결과:\n\n"
             for i, f in enumerate(files, 1):
-                msg += f"{i}. 📄 {f['name']} ({f.get('modifiedTime','')[:10]})\n"
-            msg += "\n💡 번호로 전송/이메일 첨부 가능!"
+                msg += f"{i}. {f['name']} ({f.get('modifiedTime','')[:10]})\n"
+            msg += "\n번호로 전송/이메일 첨부 가능!"
             await update.message.reply_text(msg)
         else:
-            await update.message.reply_text(f"😅 '{kw}' 결과 없음")
+            await update.message.reply_text(f"'{kw}' 결과 없음")
 
     elif "[DRIVE_LIST]" in resp:
         files = list_drive_files()
@@ -809,10 +777,10 @@ async def handle_message(update, context):
             db_set_state(u.id, "search_results", files)
             msg = "📁 파일 목록:\n\n"
             for i, f in enumerate(files, 1):
-                msg += f"{i}. 📄 {f['name']} ({f.get('modifiedTime','')[:10]})\n"
+                msg += f"{i}. {f['name']} ({f.get('modifiedTime','')[:10]})\n"
             await update.message.reply_text(msg)
         else:
-            await update.message.reply_text("📁 파일 없음")
+            await update.message.reply_text("파일 없음")
 
     elif "[DRIVE_SEND:" in resp:
         try:
@@ -820,18 +788,18 @@ async def handle_message(update, context):
             files = db_get_state(u.id, "search_results")
             if 0 <= num < len(files):
                 fi = files[num]
-                await update.message.reply_text(f"📤 '{fi['name']}' 전송 중...")
+                await update.message.reply_text(f"'{fi['name']}' 전송 중...")
                 buf, name = download_drive_file(fi["id"])
                 if buf:
                     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
-                    await update.message.reply_document(document=buf, filename=name, caption=f"📄 {name}")
+                    await update.message.reply_document(document=buf, filename=name, caption=name)
                     db_set_state(u.id, "last_action", {"type": "file", "file_id": fi["id"], "name": name})
                 else:
-                    await update.message.reply_text("❌ 다운로드 실패")
+                    await update.message.reply_text("다운로드 실패")
             else:
-                await update.message.reply_text("❌ 잘못된 번호")
-        except:
-            await update.message.reply_text("❌ 번호 확인 필요")
+                await update.message.reply_text("잘못된 번호")
+        except Exception:
+            await update.message.reply_text("번호 확인 필요")
 
     elif "[EMAIL_WITH_FILE:" in resp:
         try:
@@ -840,7 +808,7 @@ async def handle_message(update, context):
             files = db_get_state(u.id, "search_results")
             if 0 <= fnum < len(files):
                 fi = files[fnum]
-                await update.message.reply_text(f"📧 '{fi['name']}' 첨부하여 전송 중...")
+                await update.message.reply_text(f"'{fi['name']}' 첨부하여 전송 중...")
                 buf, name = download_drive_file(fi["id"])
                 if buf:
                     ok, msg = send_gmail(to_addr, subject, body, buf, name)
@@ -851,29 +819,29 @@ async def handle_message(update, context):
                             "body": body, "file_id": fi["id"], "file_name": name
                         })
                     else:
-                        await update.message.reply_text(f"❌ 전송 실패: {msg}")
+                        await update.message.reply_text(f"전송 실패: {msg}")
                 else:
-                    await update.message.reply_text("❌ 파일 다운로드 실패")
+                    await update.message.reply_text("파일 다운로드 실패")
             else:
-                await update.message.reply_text("❌ 잘못된 파일 번호")
+                await update.message.reply_text("잘못된 파일 번호")
         except Exception as e:
             logger.error(f"Email+file error: {e}")
-            await update.message.reply_text("❌ 이메일 전송 실패")
+            await update.message.reply_text("이메일 전송 실패")
 
     elif "[EMAIL:" in resp:
         try:
             parts = resp.split("[EMAIL:")[1].split("]")[0].split("|")
             to_addr, subject, body = parts[0], parts[1], parts[2]
-            await update.message.reply_text(f"📧 {to_addr}로 전송 중...")
+            await update.message.reply_text(f"{to_addr}로 전송 중...")
             ok, msg = send_gmail(to_addr, subject, body)
             if ok:
                 await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
                 db_set_state(u.id, "last_action", {"type": "email", "to": to_addr, "subject": subject, "body": body})
             else:
-                await update.message.reply_text(f"❌ 전송 실패: {msg}")
+                await update.message.reply_text(f"전송 실패: {msg}")
         except Exception as e:
             logger.error(f"Email error: {e}")
-            await update.message.reply_text("❌ 이메일 전송 실패")
+            await update.message.reply_text("이메일 전송 실패")
 
     elif "[GMAIL_LIST:" in resp:
         query = resp.split("[GMAIL_LIST:")[1].split("]")[0]
@@ -885,11 +853,11 @@ async def handle_message(update, context):
             for i, e in enumerate(emails, 1):
                 sender = e["from"].split("<")[0].strip()[:20]
                 subject = e["subject"][:30]
-                msg += f"{i}. 👤 {sender}\n 📌 {subject}\n\n"
-            msg += "💡 '1번 메일 읽어줘'라고 하세요!"
+                msg += f"{i}. {sender}\n   {subject}\n\n"
+            msg += "1번 메일 읽어줘 라고 하세요!"
             await update.message.reply_text(msg)
         else:
-            await update.message.reply_text("📭 메일 없음")
+            await update.message.reply_text("메일 없음")
 
     elif "[GMAIL_READ:" in resp:
         try:
@@ -900,23 +868,23 @@ async def handle_message(update, context):
                 content = get_gmail_content(emails[num]["id"])
                 if content:
                     msg = (f"📧 메일 내용\n\n"
-                           f"👤 {content['from']}\n"
-                           f"📌 {content['subject']}\n"
-                           f"📅 {content['date']}\n\n"
-                           f"📝 내용:\n{content['body']}")
+                           f"보낸이: {content['from']}\n"
+                           f"제목: {content['subject']}\n"
+                           f"날짜: {content['date']}\n\n"
+                           f"내용:\n{content['body']}")
                     if len(msg) > 4096:
                         for i in range(0, len(msg), 4096):
                             await update.message.reply_text(msg[i:i+4096])
                     else:
                         await update.message.reply_text(msg)
                     summary = await ask_claude(u.id, f"이 메일 내용을 간단히 요약해줘:\n{content['body']}")
-                    await update.message.reply_text(f"🔍 요약: {summary}")
+                    await update.message.reply_text(f"요약: {summary}")
                 else:
-                    await update.message.reply_text("❌ 메일 읽기 실패")
+                    await update.message.reply_text("메일 읽기 실패")
             else:
-                await update.message.reply_text("❌ 잘못된 번호")
-        except:
-            await update.message.reply_text("❌ 번호 확인 필요")
+                await update.message.reply_text("잘못된 번호")
+        except Exception:
+            await update.message.reply_text("번호 확인 필요")
 
     elif "[MEMO_SAVE:" in resp:
         content = resp.split("[MEMO_SAVE:")[1].split("]")[0]
@@ -930,9 +898,9 @@ async def handle_message(update, context):
                     await update.message.reply_text(f"📝 메모 저장 완료!\n\n{content}")
                 except Exception as e:
                     logger.error(f"Memo save error: {e}")
-                    await update.message.reply_text("❌ 메모 저장 실패")
+                    await update.message.reply_text("메모 저장 실패")
         else:
-            await update.message.reply_text("❌ DB 미연결 — 메모 저장 불가")
+            await update.message.reply_text("DB 미연결")
 
     elif "[MEMO_LIST]" in resp:
         await cmd_memo(update, context)
@@ -974,7 +942,7 @@ def main():
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info(f"Bot started! DB: {'✅ PostgreSQL' if db_available else '⚠️ in-memory'}")
+    logger.info(f"Bot started! DB: {'PostgreSQL' if db_available else 'in-memory'}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
