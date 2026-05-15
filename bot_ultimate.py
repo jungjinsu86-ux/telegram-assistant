@@ -94,6 +94,12 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_memo_user ON memos(user_id);
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS notified_emails (
+                email_id TEXT PRIMARY KEY,
+                notified_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
         logger.info("DB tables initialized!")
         return True
     except Exception as e:
@@ -107,6 +113,7 @@ _mem_history = defaultdict(list)
 _mem_search = defaultdict(list)
 _mem_gmail = defaultdict(list)
 _mem_action = defaultdict(dict)
+_mem_notified_emails: set = set()
 db_available = False
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
@@ -965,8 +972,50 @@ async def handle_message(update, context):
 # ━━━━━━━━━━━━━━━━━━━━━━━
 # 메인
 # ━━━━━━━━━━━━━━━━━━━━━━━
+def _get_notified_email_ids(email_ids: list) -> set:
+    """DB 또는 메모리에서 이미 알림 보낸 메일 ID 집합 반환"""
+    if not db_available:
+        return _mem_notified_emails & set(email_ids)
+    conn = get_db()
+    if not conn:
+        return _mem_notified_emails & set(email_ids)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT email_id FROM notified_emails WHERE email_id = ANY(%s)",
+            (email_ids,)
+        )
+        return {row[0] for row in cur.fetchall()}
+    except Exception as e:
+        logger.error(f"notified_emails query error: {e}")
+        return set()
+    finally:
+        conn.close()
+
+def _record_notified_emails(email_ids: list):
+    """알림 보낸 메일 ID를 DB 또는 메모리에 기록, 7일 지난 항목 정리"""
+    if not db_available:
+        _mem_notified_emails.update(email_ids)
+        return
+    conn = get_db()
+    if not conn:
+        _mem_notified_emails.update(email_ids)
+        return
+    try:
+        cur = conn.cursor()
+        for eid in email_ids:
+            cur.execute(
+                "INSERT INTO notified_emails (email_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (eid,)
+            )
+        cur.execute("DELETE FROM notified_emails WHERE notified_at < NOW() - INTERVAL '7 days'")
+    except Exception as e:
+        logger.error(f"notified_emails insert error: {e}")
+    finally:
+        conn.close()
+
 async def check_new_emails(app):
-    """1시간마다 새 메일 체크해서 텔레그램 알림"""
+    """1시간마다 새 메일 체크해서 텔레그램 알림 (중복 알림 방지)"""
     if not gmail_service or not ALLOWED_USER_IDS:
         return
     try:
@@ -974,15 +1023,26 @@ async def check_new_emails(app):
         emails = get_gmail_list(5, "is:unread newer_than:65m")
         if not emails:
             return
+
+        # 이미 알림 보낸 메일 제외
+        email_ids = [e["id"] for e in emails]
+        already_notified = _get_notified_email_ids(email_ids)
+        new_emails = [e for e in emails if e["id"] not in already_notified]
+        if not new_emails:
+            return
+
         uid = next(iter(ALLOWED_USER_IDS))
         msg = "📬 새 메일 도착!\n\n"
-        for i, e in enumerate(emails, 1):
+        for i, e in enumerate(new_emails, 1):
             sender = e["from"].split("<")[0].strip()[:20]
             subject = e["subject"][:30]
             msg += f"{i}. {sender}\n   {subject}\n\n"
         msg += "읽으려면 번호 말해주세요!"
-        db_set_state(uid, "gmail_list", emails)
+        db_set_state(uid, "gmail_list", new_emails)
         await app.bot.send_message(chat_id=uid, text=msg)
+
+        # 알림 보낸 ID 기록
+        _record_notified_emails([e["id"] for e in new_emails])
     except Exception as e:
         logger.error(f"Email check error: {e}")
 
@@ -997,7 +1057,10 @@ def main():
         await check_new_emails(context.application)
 
     job_queue = app.job_queue
-    job_queue.run_repeating(email_check_job, interval=3600, first=60)
+    if job_queue is None:
+        logger.error("Job queue unavailable — install python-telegram-bot[job-queue]")
+    else:
+        job_queue.run_repeating(email_check_job, interval=3600, first=60)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
