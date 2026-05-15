@@ -930,11 +930,39 @@ async def handle_message(update, context):
 # ━━━━━━━━━━━━━━━━━━━━━━━
 # 메인
 # ━━━━━━━━━━━━━━━━━━━━━━━
+async def check_new_emails(app):
+    """30분마다 새 메일 체크해서 텔레그램 알림"""
+    if not gmail_service or not ALLOWED_USER_IDS:
+        return
+    try:
+        emails = get_gmail_list(5, "is:unread newer_than:31m")
+        if not emails:
+            return
+        uid = next(iter(ALLOWED_USER_IDS))
+        msg = "📬 새 메일 도착!\n\n"
+        for i, e in enumerate(emails, 1):
+            sender = e["from"].split("<")[0].strip()[:20]
+            subject = e["subject"][:30]
+            msg += f"{i}. {sender}\n   {subject}\n\n"
+        msg += "읽으려면 번호 말해주세요!"
+        db_set_state(uid, "gmail_list", emails)
+        await app.bot.send_message(chat_id=uid, text=msg)
+    except Exception as e:
+        logger.error(f"Email check error: {e}")
+
 def main():
     global db_available
     db_available = init_db()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # 30분마다 메일 체크
+    job_queue = app.job_queue
+    job_queue.run_repeating(
+        lambda ctx: asyncio.create_task(check_new_emails(app)),
+        interval=3600,
+        first=60
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
