@@ -838,11 +838,21 @@ async def handle_message(update, context):
         # 여러 [DRIVE_SEND:N] 명령을 모두 처리
         nums = re.findall(r'\[DRIVE_SEND:(\d+)\]', resp)
         files = db_get_state(u.id, "search_results")
-        for num_str in nums:
-            try:
-                num = int(num_str) - 1
-                if 0 <= num < len(files):
+        if not nums:
+            await update.message.reply_text("파일 번호를 인식하지 못했습니다. 다시 검색해 주세요.")
+        elif not files:
+            await update.message.reply_text("검색 결과가 없습니다. 먼저 파일을 검색해 주세요.")
+        else:
+            for num_str in nums:
+                try:
+                    num = int(num_str) - 1
+                    if not (0 <= num < len(files)):
+                        await update.message.reply_text(f"{num_str}번 파일이 없습니다. (검색 결과: {len(files)}개)")
+                        continue
                     fi = files[num]
+                    if not isinstance(fi, dict) or "id" not in fi or "name" not in fi:
+                        await update.message.reply_text("파일 정보가 손상됐습니다. 다시 검색해 주세요.")
+                        continue
                     await update.message.reply_text(f"'{fi['name']}' 전송 중...")
                     buf, name = download_drive_file(fi["id"])
                     if buf:
@@ -851,10 +861,9 @@ async def handle_message(update, context):
                         db_set_state(u.id, "last_action", {"type": "file", "file_id": fi["id"], "name": name})
                     else:
                         await update.message.reply_text(f"'{fi['name']}' 다운로드 실패")
-                else:
-                    await update.message.reply_text(f"{num_str}번: 잘못된 번호")
-            except Exception:
-                await update.message.reply_text("번호 확인 필요")
+                except Exception as e:
+                    logger.error(f"DRIVE_SEND error: {e}")
+                    await update.message.reply_text("파일 전송 중 오류가 발생했습니다.")
 
     elif "[EMAIL_WITH_FILE:" in resp:
         try:
@@ -915,31 +924,38 @@ async def handle_message(update, context):
             await update.message.reply_text("메일 없음")
 
     elif "[GMAIL_READ:" in resp:
-        try:
-            num = int(resp.split("[GMAIL_READ:")[1].split("]")[0]) - 1
-            emails = db_get_state(u.id, "gmail_list")
-            if 0 <= num < len(emails):
-                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-                content = get_gmail_content(emails[num]["id"])
-                if content:
-                    msg = (f"📧 메일 내용\n\n"
-                           f"보낸이: {content['from']}\n"
-                           f"제목: {content['subject']}\n"
-                           f"날짜: {content['date']}\n\n"
-                           f"내용:\n{content['body']}")
-                    if len(msg) > 4096:
-                        for i in range(0, len(msg), 4096):
-                            await update.message.reply_text(msg[i:i+4096])
-                    else:
-                        await update.message.reply_text(msg)
-                    summary = await ask_claude(u.id, f"이 메일 내용을 간단히 요약해줘:\n{content['body']}")
-                    await update.message.reply_text(f"요약: {summary}")
+        match = re.search(r'\[GMAIL_READ:(\d+)\]', resp)
+        if not match:
+            await update.message.reply_text("메일 번호를 인식하지 못했습니다.")
+        else:
+            try:
+                num = int(match.group(1)) - 1
+                emails = db_get_state(u.id, "gmail_list")
+                if not emails:
+                    await update.message.reply_text("메일 목록이 없습니다. 먼저 메일을 확인해 주세요.")
+                elif not (0 <= num < len(emails)):
+                    await update.message.reply_text(f"잘못된 번호입니다. (목록: {len(emails)}개)")
                 else:
-                    await update.message.reply_text("메일 읽기 실패")
-            else:
-                await update.message.reply_text("잘못된 번호")
-        except Exception:
-            await update.message.reply_text("번호 확인 필요")
+                    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+                    content = get_gmail_content(emails[num]["id"])
+                    if content:
+                        msg = (f"📧 메일 내용\n\n"
+                               f"보낸이: {content['from']}\n"
+                               f"제목: {content['subject']}\n"
+                               f"날짜: {content['date']}\n\n"
+                               f"내용:\n{content['body']}")
+                        if len(msg) > 4096:
+                            for i in range(0, len(msg), 4096):
+                                await update.message.reply_text(msg[i:i+4096])
+                        else:
+                            await update.message.reply_text(msg)
+                        summary = await ask_claude(u.id, f"이 메일 내용을 간단히 요약해줘:\n{content['body']}")
+                        await update.message.reply_text(f"요약: {summary}")
+                    else:
+                        await update.message.reply_text("메일 읽기 실패")
+            except Exception as e:
+                logger.error(f"GMAIL_READ error: {e}")
+                await update.message.reply_text("메일 읽기 중 오류가 발생했습니다.")
 
     elif "[MEMO_SAVE:" in resp:
         content = resp.split("[MEMO_SAVE:")[1].split("]")[0]
@@ -1040,6 +1056,8 @@ async def check_new_emails(app):
         msg += "읽으려면 번호 말해주세요!"
         db_set_state(uid, "gmail_list", new_emails)
         await app.bot.send_message(chat_id=uid, text=msg)
+        # 히스토리에 추가해야 Claude가 다음 "1번 줘" 요청 시 파일/메일 컨텍스트를 구분할 수 있음
+        db_add_message(uid, "assistant", msg)
 
         # 알림 보낸 ID 기록
         _record_notified_emails([e["id"] for e in new_emails])
