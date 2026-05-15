@@ -106,41 +106,31 @@ def send_email(to_addr, subject, body, attach_buf=None, attach_name=None):
     if not RESEND_API_KEY:
         return False, "Resend API key not set"
     try:
-        from_addr = f"비서봇 <onboarding@resend.dev>"
-        if GMAIL_ADDRESS:
-            reply_to = GMAIL_ADDRESS
-        else:
-            reply_to = None
-
+        import httpx
+        from_addr = "onboarding@resend.dev"
         email_data = {
             "from": from_addr,
             "to": [to_addr],
             "subject": subject,
             "text": body,
         }
-        if reply_to:
-            email_data["reply_to"] = reply_to
-
         if attach_buf and attach_name:
             attach_buf.seek(0)
             file_b64 = base64.b64encode(attach_buf.read()).decode("utf-8")
             email_data["attachments"] = [{"filename": attach_name, "content": file_b64}]
 
-        data = json.dumps(email_data).encode("utf-8")
-        req = urllib.request.Request(
-            "https://api.resend.com/emails",
-            data=data,
-            headers={
-                "Authorization": f"Bearer {RESEND_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            if result.get("id"):
-                return True, "OK"
-            return False, str(result)
+        with httpx.Client() as hclient:
+            resp = hclient.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                         "Content-Type": "application/json"},
+                json=email_data,
+                timeout=30,
+            )
+        logger.info(f"Resend response: {resp.status_code} {resp.text}")
+        if resp.status_code == 200 or resp.status_code == 201:
+            return True, "OK"
+        return False, f"HTTP {resp.status_code}: {resp.text}"
     except Exception as e:
         logger.error(f"Email error: {e}")
         return False, str(e)
