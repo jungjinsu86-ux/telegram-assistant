@@ -11,7 +11,7 @@ from psycopg2.extras import Json
 import requests
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 import anthropic
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
@@ -852,6 +852,13 @@ async def handle_message(update, context):
                     await update.message.reply_text(f"'{fi['name']}' 전송 중...")
                     buf, name = download_drive_file(fi["id"])
                     if buf:
+                        file_bytes = buf.getvalue()
+                        if len(file_bytes) > 50 * 1024 * 1024:
+                            await update.message.reply_text(
+                                f"'{name}' 파일이 50MB를 초과해 텔레그램으로 전송할 수 없습니다."
+                            )
+                            continue
+                        buf.seek(0)
                         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
                         await update.message.reply_document(document=buf, filename=name, caption=name)
                         db_set_state(u.id, "last_action", {"type": "file", "file_id": fi["id"], "name": name})
