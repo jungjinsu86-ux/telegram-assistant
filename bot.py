@@ -143,13 +143,17 @@ def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
         msg["From"] = GMAIL_ADDRESS
         msg["To"] = to_addr
         msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
+        msg.attach(MIMEText(body, "plain", "utf-8"))
         if attach_buf and attach_name:
             attach_buf.seek(0)
             part = MIMEBase("application", "octet-stream")
             part.set_payload(attach_buf.read())
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={attach_name}")
+            part.add_header(
+  "Content-Disposition",
+    "attachment",
+    filename=("utf-8", "", attach_name)
+)
             msg.attach(part)
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
         gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
