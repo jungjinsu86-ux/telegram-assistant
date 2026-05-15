@@ -122,7 +122,8 @@ def send_email(to_addr, subject, body, attach_buf=None, attach_name=None):
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", f"attachment; filename={attach_name}")
             msg.attach(part)
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+      with smtplib.SMTP("smtp.gmail.com", 587) as s:
+            s.starttls()
             s.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
             s.sendmail(GMAIL_ADDRESS, to_addr, msg.as_string())
         return True, "OK"
