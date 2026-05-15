@@ -130,7 +130,7 @@ def db_get_history(user_id):
         conn.close()
         return []
 
-def db_add_message(user_id, role, content):
+def (user_id, role, content):
     if not db_available:
         _mem_history[user_id].append({"role": role, "content": content})
         if len(_mem_history[user_id]) > MAX_HISTORY:
@@ -584,8 +584,7 @@ async def ask_claude(user_id, message):
         text_parts = [block.text for block in r.content if block.type == "text"]
         txt = "\n".join(text_parts) if text_parts else "응답 없음"
 
-        # assistant 응답을 content 블록 리스트로 저장
-       db_add_message(user_id, "assistant", txt)
+        db_add_message(user_id, "assistant", txt)
         return txt
     except anthropic.APIError as e:
         logger.error(f"Claude error: {e}")
