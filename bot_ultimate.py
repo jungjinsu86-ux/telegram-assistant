@@ -699,6 +699,7 @@ async def handle_voice(update, context):
             await update.message.reply_text(f"분석:\n\n{analysis}")
     else:
         await update.message.reply_text("음성 인식 실패")
+        db_add_message(u.id, "assistant", "음성 파일 분석을 시도했으나 음성 인식에 실패했습니다.")
 
 async def handle_audio_file(update, context):
     u = update.effective_user
