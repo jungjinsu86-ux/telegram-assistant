@@ -1,4 +1,4 @@
-import os, json, logging, io, base64, tempfile
+import os, json, logging, io, base64, tempfile, asyncio
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -935,7 +935,7 @@ async def check_new_emails(app):
     if not gmail_service or not ALLOWED_USER_IDS:
         return
     try:
-        emails = get_gmail_list(5, "is:unread newer_than:31m")
+        emails = get_gmail_list(5, "is:unread newer_than:61m")
         if not emails:
             return
         uid = next(iter(ALLOWED_USER_IDS))
@@ -956,13 +956,12 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # 30분마다 메일 체크
+    # 1시간마다 메일 체크
+    async def email_check_job(context):
+        await check_new_emails(context.application)
+
     job_queue = app.job_queue
-    job_queue.run_repeating(
-        lambda ctx: asyncio.create_task(check_new_emails(app)),
-        interval=3600,
-        first=60
-    )
+    job_queue.run_repeating(email_check_job, interval=3600, first=60)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
