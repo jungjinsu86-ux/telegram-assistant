@@ -139,6 +139,7 @@ def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
     if not gmail_service:
         return False, "Gmail not connected"
     try:
+        gmail_creds.refresh(Request())
         msg = MIMEMultipart()
         msg["From"] = GMAIL_ADDRESS
         msg["To"] = to_addr
