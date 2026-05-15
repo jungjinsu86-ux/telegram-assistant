@@ -62,10 +62,6 @@ def init_db():
         return False
     try:
         cur = conn.cursor()
-        # 기존 테이블 스키마 문제 자동 수정
-        cur.execute("""
-            DROP TABLE IF EXISTS conversation_history;
-        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS conversation_history (
                 id SERIAL PRIMARY KEY,
@@ -307,7 +303,7 @@ def download_drive_file(file_id):
     if not drive_service:
         return None, None
     try:
-        meta = drive_service.files().get(fileId=file_id, fields="name, mimeType").execute()
+        meta = drive_service.files().get(fileId=file_id, fields="name, mimeType", supportsAllDrives=True).execute()
         mime = meta.get("mimeType", "")
         if mime.startswith("application/vnd.google-apps."):
             export_map = {
@@ -323,7 +319,7 @@ def download_drive_file(file_id):
             else:
                 return None, None
         else:
-            req = drive_service.files().get_media(fileId=file_id)
+            req = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
             name = meta["name"]
         buf = io.BytesIO()
         dl = MediaIoBaseDownload(buf, req)
@@ -739,6 +735,7 @@ async def handle_audio_file(update, context):
             await update.message.reply_text(f"분석:\n\n{analysis}")
     else:
         await update.message.reply_text("음성 인식 실패")
+        db_add_message(u.id, "assistant", "음성 파일 분석을 시도했으나 음성 인식에 실패했습니다.")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
 # 메인 메시지 핸들러
