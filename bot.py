@@ -43,9 +43,9 @@ if GOOGLE_CREDENTIALS_JSON:
         )
         drive_service = build("drive", "v3", credentials=creds)
         speech_service = build("speech", "v1", credentials=creds)
-        logger.info("Google Drive + Speech 연결 성공!")
+        logger.info("Google Drive + Speech connected!")
     except Exception as e:
-        logger.error(f"Google 연결 실패: {e}")
+        logger.error(f"Google connection failed: {e}")
 
 def search_drive_files(query_text, max_results=10):
     if not drive_service:
@@ -57,7 +57,7 @@ def search_drive_files(query_text, max_results=10):
             supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
         return r.get("files", [])
     except Exception as e:
-        logger.error(f"Drive 검색 오류: {e}")
+        logger.error(f"Drive search error: {e}")
         return []
 
 def list_drive_files(max_results=20):
@@ -70,7 +70,7 @@ def list_drive_files(max_results=20):
             supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
         return r.get("files", [])
     except Exception as e:
-        logger.error(f"Drive 목록 오류: {e}")
+        logger.error(f"Drive list error: {e}")
         return []
 
 def download_drive_file(file_id):
@@ -103,12 +103,12 @@ def download_drive_file(file_id):
         buf.seek(0)
         return buf, name
     except Exception as e:
-        logger.error(f"Drive 다운로드 오류: {e}")
+        logger.error(f"Drive download error: {e}")
         return None, None
 
 def send_email(to_addr, subject, body, attach_buf=None, attach_name=None):
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
-        return False, "이메일 미설정"
+        return False, "Email not configured"
     try:
         msg = MIMEMultipart()
         msg["From"] = GMAIL_ADDRESS
@@ -125,9 +125,9 @@ def send_email(to_addr, subject, body, attach_buf=None, attach_name=None):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
             s.sendmail(GMAIL_ADDRESS, to_addr, msg.as_string())
-        return True, "전송 성공"
+        return True, "OK"
     except Exception as e:
-        logger.error(f"이메일 오류: {e}")
+        logger.error(f"Email error: {e}")
         return False, str(e)
 
 def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
@@ -148,9 +148,9 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
         results = resp.get("results", [])
         if results:
             return " ".join(r["alternatives"][0]["transcript"] for r in results if r.get("alternatives"))
-        return "음성을 인식하지 못했습니다."
+        return "No speech detected."
     except Exception as e:
-        logger.error(f"음성 인식 오류: {e}")
+        logger.error(f"Speech error: {e}")
         return None
 
 SYSTEM_PROMPT = """당신은 텔레그램에서 동작하는 정진수님의 개인 비서입니다.
@@ -160,9 +160,10 @@ SYSTEM_PROMPT = """당신은 텔레그램에서 동작하는 정진수님의 개
 1. Google Drive 파일 검색/전송
 2. 이메일 전송 (파일 첨부 가능)
 3. 음성/통화녹음 분석
-4. 일반 대화 및 업무 지원
+4. 웹 검색 (실시간 정보 검색)
+5. 일반 대화 및 업무 지원
 
-명령 형식:
+Drive 명령 형식:
 - 파일 검색: [DRIVE_SEARCH:검색어]
 - 파일 목록: [DRIVE_LIST]
 - 파일 전송: [DRIVE_SEND:번호]
@@ -172,13 +173,16 @@ SYSTEM_PROMPT = """당신은 텔레그램에서 동작하는 정진수님의 개
 예시:
 - "출강 의뢰서 찾아줘" -> [DRIVE_SEARCH:출강 의뢰서]
 - "1번 보내줘" -> [DRIVE_SEND:1]
-- "1번 파일 abc@gmail.com으로 메일 보내줘" -> [EMAIL_WITH_FILE:abc@gmail.com|파일 전송|첨부 파일 보내드립니다.|1]
+- "1번 파일 abc@gmail.com으로 보내줘" -> [EMAIL_WITH_FILE:abc@gmail.com|파일 전송|첨부 파일 보내드립니다.|1]
 - "abc@gmail.com에 회의 안내 메일 보내줘" -> [EMAIL:abc@gmail.com|회의 안내|안녕하세요, 회의 안내드립니다.]
+
+웹 검색은 자동으로 수행됩니다. 최신 뉴스, 날씨, 주가 등 실시간 정보가 필요하면 검색 도구를 사용하세요.
 
 규칙:
 - 간결하게 답변
 - 모르면 솔직히 답변
-- 이메일 주소 모르면 물어보기"""
+- 이메일 주소 모르면 물어보기
+- 최신 정보가 필요하면 웹 검색 활용"""
 
 def is_authorized(uid):
     return not ALLOWED_USER_IDS or uid in ALLOWED_USER_IDS
@@ -191,11 +195,20 @@ async def ask_claude(user_id, message):
     if len(history) > MAX_HISTORY:
         history[:] = history[-MAX_HISTORY:]
     try:
-        r = client.messages.create(model="claude-sonnet-4-6", max_tokens=2048,
+        r = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
             system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-            messages=history)
-        txt = r.content[0].text
-        history.append({"role": "assistant", "content": txt})
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+            messages=history,
+        )
+        # Extract text from response blocks
+        text_parts = []
+        for block in r.content:
+            if block.type == "text":
+                text_parts.append(block.text)
+        txt = "\n".join(text_parts) if text_parts else "응답을 생성하지 못했습니다."
+        history.append({"role": "assistant", "content": r.content})
         return txt
     except anthropic.APIError as e:
         logger.error(f"Claude error: {e}")
@@ -212,7 +225,7 @@ async def cmd_start(update, context):
     s = "✅" if speech_service else "❌"
     await update.message.reply_text(
         f"안녕하세요, {u.first_name}님! 👋\n\n"
-        f"📁 Drive: {d}  📧 이메일: {e}  🎙️ 음성: {s}\n\n"
+        f"📁 Drive: {d}  📧 이메일: {e}  🎙️ 음성: {s}  🔍 웹검색: ✅\n\n"
         f"/files - 파일 목록\n/clear - 초기화\n/help - 도움말")
 
 async def cmd_clear(update, context):
@@ -245,6 +258,7 @@ async def cmd_help(update, context):
     await update.message.reply_text(
         "📖 사용 가이드\n\n"
         "💬 대화: 메시지 보내면 AI 답변\n\n"
+        "🔍 검색: '오늘 뉴스', '코스피 지수' 등 물어보면 실시간 검색\n\n"
         "📁 파일: '파일 찾아줘', '1번 보내줘', /files\n\n"
         "📧 이메일: '1번 파일 abc@gmail.com으로 보내줘'\n\n"
         "🎙️ 음성: 음성메시지 또는 녹음파일 보내면 자동 분석\n\n"
@@ -373,8 +387,8 @@ async def handle_message(update, context):
             else:
                 await update.message.reply_text("❌ 잘못된 파일 번호")
         except Exception as e:
-            logger.error(f"이메일+파일 오류: {e}")
-            await update.message.reply_text("❌ 이메일 전송 실패. 형식을 확인해주세요.")
+            logger.error(f"Email+file error: {e}")
+            await update.message.reply_text("❌ 이메일 전송 실패")
 
     elif "[EMAIL:" in resp:
         try:
@@ -386,7 +400,7 @@ async def handle_message(update, context):
             else:
                 await update.message.reply_text(f"❌ 전송 실패: {msg}")
         except Exception as e:
-            logger.error(f"이메일 오류: {e}")
+            logger.error(f"Email error: {e}")
             await update.message.reply_text("❌ 이메일 전송 실패")
 
     else:
@@ -409,7 +423,7 @@ def main():
         filters.Document.MimeType("audio/ogg") | filters.Document.MimeType("audio/wav") |
         filters.Document.MimeType("audio/x-m4a"), handle_audio_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("🤖 비서 봇 시작! (Drive + Email + Speech)")
+    logger.info("Bot started! (Drive + Email + Speech + Web Search)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
