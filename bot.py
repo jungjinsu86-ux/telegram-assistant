@@ -1,4 +1,5 @@
-import os, json, logging, io, base64, tempfile
+import os, json, logging, io, base64
+import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -29,6 +30,9 @@ GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+CLOVA_INVOKE_URL = os.environ.get("CLOVA_INVOKE_URL", "")
+CLOVA_SECRET_KEY = os.environ.get("CLOVA_SECRET_KEY", "")
+clova_available = bool(CLOVA_INVOKE_URL and CLOVA_SECRET_KEY)
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -64,6 +68,13 @@ def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS notified_mail_ids (
+                mail_id TEXT PRIMARY KEY,
+                notified_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute("DELETE FROM notified_mail_ids WHERE notified_at < NOW() - INTERVAL '7 days'")
         conn.commit()
         cur.close()
         conn.close()
@@ -121,23 +132,20 @@ def get_memos_for_prompt(user_id):
         text += f"- {content} ({created_at.strftime('%m/%d')})\n"
     return text
 
-# ── Google Drive + Speech
+# ── Google Drive
 drive_service = None
-speech_service = None
 if GOOGLE_CREDENTIALS_JSON:
     try:
         creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
         sa_creds = service_account.Credentials.from_service_account_info(
             creds_dict, scopes=[
                 "https://www.googleapis.com/auth/drive.readonly",
-                "https://www.googleapis.com/auth/cloud-platform",
             ]
         )
         drive_service = build("drive", "v3", credentials=sa_creds)
-        speech_service = build("speech", "v1", credentials=sa_creds)
-        logger.info("Drive + Speech connected!")
+        logger.info("Drive connected!")
     except Exception as e:
-        logger.error(f"Drive/Speech error: {e}")
+        logger.error(f"Drive error: {e}")
 
 # ── Gmail API
 gmail_service = None
@@ -167,7 +175,8 @@ def search_drive_files(query_text, max_results=10):
     if not drive_service:
         return []
     try:
-        q = f"name contains '{query_text}' and trashed = false"
+        safe = query_text.replace("\\", "\\\\").replace("'", "\\'")
+        q = f"name contains '{safe}' and trashed = false"
         r = drive_service.files().list(q=q, pageSize=max_results,
             fields="files(id, name, mimeType, modifiedTime)",
             supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
@@ -308,63 +317,50 @@ def get_gmail_content(msg_id):
         logger.error(f"Gmail read error: {e}")
         return None
 
-# ── Speech
+# ── Speech (CLOVA)
 def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
-    if not speech_service:
+    if not clova_available:
         return None
     try:
-        from pydub import AudioSegment
-
-        ext_map = {
-            "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
-            "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/m4a": ".m4a",
-            "audio/wav": ".wav", "audio/x-wav": ".wav", "video/mp4": ".mp4",
+        headers = {
+            "Accept": "application/json;UTF-8",
+            "X-CLOVASPEECH-API-KEY": CLOVA_SECRET_KEY,
         }
-        ext = ext_map.get(mime_type, ".mp3")
-
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
-            f.write(audio_bytes)
-            tmp_in = f.name
-
-        audio = AudioSegment.from_file(tmp_in)
-        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        os.unlink(tmp_in)
-
-        chunk_ms = 55 * 1000
-        chunks = [audio[i:i+chunk_ms] for i in range(0, len(audio), chunk_ms)]
-
-        full_transcript = []
-        for chunk in chunks:
-            tmp_out = tempfile.mktemp(suffix=".wav")
-            chunk.export(tmp_out, format="wav")
-            with open(tmp_out, "rb") as f:
-                wav_bytes = f.read()
-            os.unlink(tmp_out)
-
-            body = {
-                "config": {
-                    "encoding": "LINEAR16",
-                    "sampleRateHertz": 16000,
-                    "languageCode": "ko-KR",
-                    "alternativeLanguageCodes": ["en-US"],
-                    "enableAutomaticPunctuation": True,
-                    "model": "latest_long",
-                    "useEnhanced": True,
+        files = {
+            "media": ("audio.m4a", audio_bytes, mime_type),
+            "params": (None, json.dumps({
+                "language": "ko-KR",
+                "completion": "sync",
+                "speaker": True,
+                "diarization": {
+                    "enable": True,
+                    "speakerCountMin": 2,
+                    "speakerCountMax": 2,
                 },
-                "audio": {"content": base64.b64encode(wav_bytes).decode("utf-8")},
-            }
-            resp = speech_service.speech().recognize(body=body).execute()
-            results = resp.get("results", [])
-            if results:
-                text = " ".join(
-                    r["alternatives"][0]["transcript"]
-                    for r in results if r.get("alternatives")
-                )
-                full_transcript.append(text)
-
-        return " ".join(full_transcript) if full_transcript else "음성 인식 결과 없음"
+            }), "application/json"),
+        }
+        response = requests.post(
+            CLOVA_INVOKE_URL + "/recognizer/upload",
+            headers=headers,
+            files=files,
+            timeout=300,
+        )
+        if response.status_code == 200:
+            result = response.json()
+            segments = result.get("segments", [])
+            if segments:
+                txt = ""
+                for seg in segments:
+                    speaker = seg.get("diarization", {}).get("label", "")
+                    text = seg.get("text", "")
+                    if speaker:
+                        txt += f"[화자{speaker}] {text}\n"
+                    else:
+                        txt += text + "\n"
+                return txt.strip()
+        return None
     except Exception as e:
-        logger.error(f"Speech error: {e}")
+        logger.error(f"CLOVA Speech error: {e}")
         return None
 
 SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
@@ -380,7 +376,7 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 - 웹 검색 가능
 - 음성 분석 가능 (m4a, mp3 등)
 - PostgreSQL DB 연동 (메모 저장 가능)
-- 30분마다 새 메일 자동 체크 중
+- 1시간마다 새 메일 자동 체크 중
 
 → 서버, API 연동 등 이미 다 세팅되어 있음
 → "설정이 필요하다", "서버가 있어야 한다" 같은 말 하지 말 것
@@ -527,13 +523,55 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 규칙: 위 예시처럼 짧고 자연스럽게.
 불필요한 설명, 형식적인 인사, 굵은 글씨 쓰지 말 것."""
 
+IMAGE_SYSTEM_PROMPT = """당신은 15년 경력의 시각 디자인 디렉터입니다.
+이미지를 분석할 때 다음 관점에서 전문적이고 구체적인 피드백을 제공합니다:
+
+1. 레이아웃/구도 - 시선 흐름, 정보 계층, 여백 활용
+2. 타이포그래피 - 폰트 선택, 가독성, 크기 대비, 줄간격
+3. 컬러 - 색 조합, 브랜드 톤, 대비, 감정 전달
+4. 메시지 전달력 - 핵심 메시지가 3초 안에 읽히는지, CTA 명확성
+5. 타겟 적합성 - 대상 고객에게 맞는 톤인지
+6. 개선 제안 - 구체적으로 "어디를 어떻게" 바꾸면 좋은지
+
+피드백 형식:
+✅ 잘된 점 (2-3개)
+⚠️ 개선 포인트 (구체적 수정 방향 포함)
+💡 한 단계 업그레이드 팁
+
+캡션에 사용자의 추가 요청이 있으면 그에 맞춰 분석 방향을 조절하세요.
+짧고 임팩트 있게, 실무에서 바로 적용 가능한 수준으로 답하세요."""
+
+INSTAGRAM_SYSTEM_PROMPT = """당신은 SNS 마케팅 13년차 전문가의 인스타그램 콘텐츠 담당 비서입니다.
+
+이미지를 분석한 뒤 인스타그램 게시물 초안을 작성합니다.
+
+작성 규칙:
+1. 첫 줄은 시선을 끄는 후킹 문장 (질문형 or 공감형)
+2. 본문은 3-5줄, 줄바꿈 활용해서 가독성 확보
+3. 이모지는 자연스럽게 섞되 거의 안쓰기
+4. 마지막에 CTA (댓글 유도, 저장 유도 등)
+5. 해시태그 5개
+6. 톤: 전문적이면서 친근한 강사 느낌
+
+캡션에 추가 지시가 있으면 (예: "강의 후기 느낌으로", "홍보용으로") 그에 맞춰 조절.
+
+출력 형식:
+📱 인스타그램 초안
+---
+[캡션 본문]
+
+[해시태그]
+---
+💡 이 초안의 포인트: (왜 이렇게 썼는지 한 줄 설명)"""
+
+INSTAGRAM_KEYWORDS = {"인스타", "캡션", "게시물", "피드"}
+
 def is_authorized(uid):
     return not ALLOWED_USER_IDS or uid in ALLOWED_USER_IDS
 
 user_search_results = defaultdict(list)
 user_gmail_list = defaultdict(list)
 user_last_action = defaultdict(dict)
-last_mail_ids = set()
 
 async def ask_claude(user_id, message):
     history = conversation_history[user_id]
@@ -560,24 +598,38 @@ async def ask_claude(user_id, message):
         history.pop()
         return "⚠️ AI 오류. 잠시 후 다시 시도하세요."
 
-# ── Gmail 자동 체크 (30분마다)
+# ── Gmail 자동 체크 (1시간마다)
 async def check_new_gmail(app):
-    global last_mail_ids
-    if not gmail_service or not ALLOWED_USER_IDS:
+    if not gmail_service or not ALLOWED_USER_IDS or not DATABASE_URL:
         return
     try:
         emails = get_gmail_list(10, "is:unread newer_than:1h")
-        new_ids = {e["id"] for e in emails}
-        truly_new = new_ids - last_mail_ids
-        if last_mail_ids and truly_new:
-            for e in emails:
-                if e["id"] in truly_new:
-                    sender = e["from"].split("<")[0].strip()[:20]
-                    subject = e["subject"][:30]
-                    msg = f"📬 새 메일 왔어요!\n\n👤 {sender}\n📌 {subject}"
-                    for uid in ALLOWED_USER_IDS:
-                        await app.bot.send_message(chat_id=uid, text=msg)
-        last_mail_ids = new_ids
+        if not emails:
+            return
+        current_ids = [e["id"] for e in emails]
+        conn = get_db()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT mail_id FROM notified_mail_ids WHERE mail_id = ANY(%s)",
+                (current_ids,)
+            )
+            already_notified = {row[0] for row in cur.fetchall()}
+            truly_new = [e for e in emails if e["id"] not in already_notified]
+            for e in truly_new:
+                sender = e["from"].split("<")[0].strip()[:20]
+                subject = e["subject"][:30]
+                msg = f"📬 새 메일 왔어요!\n\n👤 {sender}\n📌 {subject}"
+                for uid in ALLOWED_USER_IDS:
+                    await app.bot.send_message(chat_id=uid, text=msg)
+                cur.execute(
+                    "INSERT INTO notified_mail_ids (mail_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                    (e["id"],)
+                )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
     except Exception as e:
         logger.error(f"Gmail check error: {e}")
 
@@ -588,7 +640,7 @@ async def cmd_start(update, context):
         return
     d = "✅" if drive_service else "❌"
     g = "✅" if gmail_service else "❌"
-    s = "✅" if speech_service else "❌"
+    s = "✅" if clova_available else "❌"
     db = "✅" if DATABASE_URL else "❌"
     await update.message.reply_text(
         f"안녕하세요! 👋\n\n"
@@ -687,13 +739,18 @@ async def cmd_help(update, context):
 async def handle_voice(update, context):
     u = update.effective_user
     if not is_authorized(u.id): return
-    if not speech_service:
+    if not clova_available:
         await update.message.reply_text("❌ 음성 분석 미연결")
         return
     await update.message.reply_text("🎙️ 분석 중...")
     voice = update.message.voice or update.message.audio
-    f = await context.bot.get_file(voice.file_id)
-    data = await f.download_as_bytearray()
+    try:
+        f = await context.bot.get_file(voice.file_id)
+        data = await f.download_as_bytearray()
+    except Exception as e:
+        logger.error(f"Voice download error: {e}")
+        await update.message.reply_text("❌ 파일 다운로드 실패")
+        return
     txt = transcribe_audio(bytes(data), voice.mime_type or "audio/ogg")
     if txt:
         await update.message.reply_text(f"📝 텍스트:\n\n{txt}")
@@ -705,13 +762,18 @@ async def handle_voice(update, context):
 async def handle_audio_file(update, context):
     u = update.effective_user
     if not is_authorized(u.id): return
-    if not speech_service:
+    if not clova_available:
         await update.message.reply_text("❌ 음성 분석 미연결")
         return
     await update.message.reply_text("🎙️ 분석 중... (잠시 기다려주세요)")
     audio = update.message.audio or update.message.document
-    f = await context.bot.get_file(audio.file_id)
-    data = await f.download_as_bytearray()
+    try:
+        f = await context.bot.get_file(audio.file_id)
+        data = await f.download_as_bytearray()
+    except Exception as e:
+        logger.error(f"Audio download error: {e}")
+        await update.message.reply_text("❌ 파일 다운로드 실패")
+        return
     txt = transcribe_audio(bytes(data), audio.mime_type or "audio/mpeg")
     if txt:
         if len(txt) > 3000:
@@ -724,6 +786,73 @@ async def handle_audio_file(update, context):
         await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
     else:
         await update.message.reply_text("❌ 음성 인식 실패")
+
+async def handle_photo(update, context):
+    logger.info("=== PHOTO HANDLER TRIGGERED ===")
+    u = update.effective_user
+    if not is_authorized(u.id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    try:
+        caption = update.message.caption or ""
+        is_instagram = any(kw in caption for kw in INSTAGRAM_KEYWORDS)
+
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await update.message.reply_text("📱 인스타그램 초안 작성 중..." if is_instagram else "🖼️ 이미지 분석 중...")
+
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
+            mime_type = "image/jpeg"
+        else:
+            doc = update.message.document
+            file_id = doc.file_id
+            mime_type = doc.mime_type or "image/jpeg"
+
+        try:
+            tg_file = await context.bot.get_file(file_id)
+            data = await tg_file.download_as_bytearray()
+            b64 = base64.b64encode(bytes(data)).decode("utf-8")
+        except Exception as e:
+            logger.error(f"Image download error: {e}")
+            await update.message.reply_text("❌ 이미지 다운로드 실패")
+            return
+
+        if is_instagram:
+            system_prompt = INSTAGRAM_SYSTEM_PROMPT
+            prompt = caption.strip() if caption.strip() else "이 이미지를 바탕으로 인스타그램 게시물 초안을 작성해주세요"
+        else:
+            system_prompt = IMAGE_SYSTEM_PROMPT
+            prompt = caption.strip() if caption.strip() else "이 디자인을 전문적으로 분석하고 피드백해주세요"
+
+        try:
+            r = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4096,
+                system=system_prompt,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            )
+            result = r.content[0].text if r.content else "분석 결과 없음"
+        except anthropic.APIError as e:
+            logger.error(f"Claude vision error: {e}")
+            await update.message.reply_text("⚠️ AI 오류. 잠시 후 다시 시도하세요.")
+            return
+
+        if len(result) > 4096:
+            for i in range(0, len(result), 4096):
+                await update.message.reply_text(result[i:i+4096])
+        else:
+            await update.message.reply_text(result)
+
+    except Exception as e:
+        logger.error(f"handle_photo error: {e}")
+        await update.message.reply_text(f"❌ 이미지 처리 중 오류: {e}")
 
 async def handle_message(update, context):
     u = update.effective_user
@@ -795,7 +924,8 @@ async def handle_message(update, context):
                     await update.message.reply_text("❌ 다운로드 실패")
             else:
                 await update.message.reply_text("❌ 잘못된 번호")
-        except:
+        except Exception as e:
+            logger.error(f"Drive send error: {e}")
             await update.message.reply_text("❌ 번호 확인 필요")
 
     elif "[EMAIL_WITH_FILE:" in resp:
@@ -877,7 +1007,8 @@ async def handle_message(update, context):
                     await update.message.reply_text("❌ 메일 읽기 실패")
             else:
                 await update.message.reply_text("❌ 잘못된 번호")
-        except:
+        except Exception as e:
+            logger.error(f"Gmail read error: {e}")
             await update.message.reply_text("❌ 번호 확인 필요")
 
     else:
@@ -898,6 +1029,8 @@ def main():
     app.add_handler(CommandHandler("files", cmd_files))
     app.add_handler(CommandHandler("mail", cmd_mail))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.AUDIO, handle_audio_file))
     app.add_handler(MessageHandler(
@@ -911,7 +1044,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(check_new_gmail, "interval", minutes=30, args=[app])
+    scheduler.add_job(check_new_gmail, "interval", minutes=60, args=[app])
     scheduler.start()
 
     logger.info("Bot started! (Drive + Gmail + Speech + Web Search + DB + Mail Alert)")
