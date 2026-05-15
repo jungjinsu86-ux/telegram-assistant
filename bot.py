@@ -222,34 +222,33 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
     try:
         from pydub import AudioSegment
 
-        # m4a, mp4 → mp3 변환
-        if mime_type in ("audio/mp4", "audio/x-m4a", "audio/m4a", "video/mp4"):
-            with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as f:
-                f.write(audio_bytes)
-                tmp_in = f.name
-            tmp_out = tmp_in.replace(".m4a", ".mp3")
-            AudioSegment.from_file(tmp_in, format="m4a").export(tmp_out, format="mp3")
-            with open(tmp_out, "rb") as f:
-                audio_bytes = f.read()
-            mime_type = "audio/mpeg"
-            os.unlink(tmp_in)
-            os.unlink(tmp_out)
+        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as f:
+            f.write(audio_bytes)
+            tmp_in = f.name
+        tmp_out = tmp_in + ".wav"
 
-        enc_map = {
-            "audio/ogg": "OGG_OPUS", "audio/mpeg": "MP3", "audio/mp3": "MP3",
-            "audio/wav": "LINEAR16", "audio/x-wav": "LINEAR16",
-            "audio/mp4": "MP3", "audio/x-m4a": "MP3"
-        }
-        encoding = enc_map.get(mime_type, "OGG_OPUS")
+        # 모든 형식을 WAV(16kHz, 모노)로 변환 - 인식률 극대화
+        audio = AudioSegment.from_file(tmp_in)
+        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        audio.export(tmp_out, format="wav")
+
+        with open(tmp_out, "rb") as f:
+            wav_bytes = f.read()
+
+        os.unlink(tmp_in)
+        os.unlink(tmp_out)
+
         body = {
             "config": {
-                "encoding": encoding,
+                "encoding": "LINEAR16",
+                "sampleRateHertz": 16000,
                 "languageCode": "ko-KR",
                 "alternativeLanguageCodes": ["en-US"],
                 "enableAutomaticPunctuation": True,
-                "model": "latest_long"
+                "model": "phone_call",  # 통화 녹음 전용 모델
+                "useEnhanced": True,    # 향상된 인식 사용
             },
-            "audio": {"content": base64.b64encode(audio_bytes).decode("utf-8")},
+            "audio": {"content": base64.b64encode(wav_bytes).decode("utf-8")},
         }
         resp = speech_service.speech().recognize(body=body).execute()
         results = resp.get("results", [])
