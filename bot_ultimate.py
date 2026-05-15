@@ -419,7 +419,60 @@ def get_gmail_content(msg_id):
 # 음성 인식
 # ━━━━━━━━━━━━━━━━━━━━━━━
 def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
-    if not speech_service:
+    import requests
+    import hmac
+    import hashlib
+    import time
+
+    CLOVA_INVOKE_URL = os.environ.get("CLOVA_INVOKE_URL", "")
+    CLOVA_SECRET_KEY = os.environ.get("CLOVA_SECRET_KEY", "")
+
+    if not CLOVA_INVOKE_URL or not CLOVA_SECRET_KEY:
+        return None
+
+    try:
+        headers = {
+            "Accept": "application/json;UTF-8",
+            "X-CLOVASPEECH-API-KEY": CLOVA_SECRET_KEY,
+        }
+
+        files = {
+            "media": ("audio.m4a", audio_bytes, mime_type),
+            "params": (None, json.dumps({
+                "language": "ko-KR",
+                "completion": "sync",
+                "speaker": True,
+                "diarization": {
+                    "enable": True,
+                    "speakerCountMin": 2,
+                    "speakerCountMax": 2
+                }
+            }), "application/json")
+        }
+
+        response = requests.post(
+            CLOVA_INVOKE_URL + "/recognizer/upload",
+            headers=headers,
+            files=files,
+            timeout=300
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            segments = result.get("segments", [])
+            if segments:
+                txt = ""
+                for seg in segments:
+                    speaker = seg.get("diarization", {}).get("label", "")
+                    text = seg.get("text", "")
+                    if speaker:
+                        txt += f"[화자{speaker}] {text}\n"
+                    else:
+                        txt += text + "\n"
+                return txt.strip()
+        return None
+    except Exception as e:
+        logger.error(f"CLOVA Speech error: {e}")
         return None
     try:
         from pydub import AudioSegment
@@ -510,6 +563,10 @@ Drive API 이미 연결됨. 검색됐으면 전송도 무조건 가능.
 "줘", "보내줘", "받아줘", "다운해줘", "다운받아줘", "보여줘",
 "전송해", "진행해", "저장해줘", "이거줘", "그거줘", "1번", "2번" 등
 숫자만 단독 입력해도 검색 결과 있으면 즉시 [DRIVE_SEND:번호]
+절대 금지:
+- "자동 알림 기능이 없습니다", "개발팀에 요청하세요" 등 기능 부재 발언 금지
+- 보유 기능 목록에 없다고 판단해서 "못한다"고 말하기 금지
+- 실제로 코드에 구현된 기능을 없다고 부정하기 금지
 
 여러 개: "1,2번", "둘다" -> [DRIVE_SEND:1] 후 [DRIVE_SEND:2]
 
