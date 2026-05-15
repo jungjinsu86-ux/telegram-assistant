@@ -1,10 +1,16 @@
-import os, json, logging, io, base64, urllib.request, urllib.parse
+import os, json, logging, io, base64
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
 from datetime import datetime
 from collections import defaultdict
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
@@ -17,7 +23,9 @@ ALLOWED_USER_IDS = (
 )
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS", "")
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
+GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
+GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,23 +34,47 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 conversation_history = defaultdict(list)
 MAX_HISTORY = 20
 
+# ── Google Drive + Speech (service account)
 drive_service = None
 speech_service = None
 if GOOGLE_CREDENTIALS_JSON:
     try:
         creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        creds = service_account.Credentials.from_service_account_info(
+        sa_creds = service_account.Credentials.from_service_account_info(
             creds_dict, scopes=[
                 "https://www.googleapis.com/auth/drive.readonly",
                 "https://www.googleapis.com/auth/cloud-platform",
             ]
         )
-        drive_service = build("drive", "v3", credentials=creds)
-        speech_service = build("speech", "v1", credentials=creds)
-        logger.info("Google Drive + Speech connected!")
+        drive_service = build("drive", "v3", credentials=sa_creds)
+        speech_service = build("speech", "v1", credentials=sa_creds)
+        logger.info("Drive + Speech connected!")
     except Exception as e:
-        logger.error(f"Google connection failed: {e}")
+        logger.error(f"Drive/Speech error: {e}")
 
+# ── Gmail API (OAuth2)
+gmail_service = None
+if GMAIL_REFRESH_TOKEN and GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET:
+    try:
+        gmail_creds = Credentials(
+            token=None,
+            refresh_token=GMAIL_REFRESH_TOKEN,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GMAIL_CLIENT_ID,
+            client_secret=GMAIL_CLIENT_SECRET,
+            scopes=[
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.send",
+                "https://www.googleapis.com/auth/gmail.modify",
+            ],
+        )
+        gmail_creds.refresh(Request())
+        gmail_service = build("gmail", "v1", credentials=gmail_creds)
+        logger.info("Gmail connected!")
+    except Exception as e:
+        logger.error(f"Gmail error: {e}")
+
+# ── Drive functions
 def search_drive_files(query_text, max_results=10):
     if not drive_service:
         return []
@@ -102,39 +134,91 @@ def download_drive_file(file_id):
         logger.error(f"Drive download error: {e}")
         return None, None
 
-def send_email(to_addr, subject, body, attach_buf=None, attach_name=None):
-    if not RESEND_API_KEY:
-        return False, "Resend API key not set"
+# ── Gmail send
+def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
+    if not gmail_service:
+        return False, "Gmail not connected"
     try:
-        import httpx
-        from_addr = "onboarding@resend.dev"
-        email_data = {
-            "from": from_addr,
-            "to": [to_addr],
-            "subject": subject,
-            "text": body,
-        }
+        msg = MIMEMultipart()
+        msg["From"] = GMAIL_ADDRESS
+        msg["To"] = to_addr
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
         if attach_buf and attach_name:
             attach_buf.seek(0)
-            file_b64 = base64.b64encode(attach_buf.read()).decode("utf-8")
-            email_data["attachments"] = [{"filename": attach_name, "content": file_b64}]
-
-        with httpx.Client() as hclient:
-            resp = hclient.post(
-                "https://api.resend.com/emails",
-                headers={"Authorization": f"Bearer {RESEND_API_KEY}",
-                         "Content-Type": "application/json"},
-                json=email_data,
-                timeout=30,
-            )
-        logger.info(f"Resend response: {resp.status_code} {resp.text}")
-        if resp.status_code == 200 or resp.status_code == 201:
-            return True, "OK"
-        return False, f"HTTP {resp.status_code}: {resp.text}"
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(attach_buf.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={attach_name}")
+            msg.attach(part)
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+        gmail_service.users().messages().send(
+            userId="me", body={"raw": raw}
+        ).execute()
+        return True, "OK"
     except Exception as e:
-        logger.error(f"Email error: {e}")
+        logger.error(f"Gmail send error: {e}")
         return False, str(e)
 
+# ── Gmail read
+def get_gmail_list(max_results=10, query=""):
+    if not gmail_service:
+        return []
+    try:
+        q = query if query else "is:unread"
+        result = gmail_service.users().messages().list(
+            userId="me", maxResults=max_results, q=q
+        ).execute()
+        messages = result.get("messages", [])
+        emails = []
+        for m in messages[:max_results]:
+            msg = gmail_service.users().messages().get(
+                userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["From", "Subject", "Date"]
+            ).execute()
+            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+            emails.append({
+                "id": m["id"],
+                "from": headers.get("From", ""),
+                "subject": headers.get("Subject", ""),
+                "date": headers.get("Date", ""),
+                "snippet": msg.get("snippet", ""),
+            })
+        return emails
+    except Exception as e:
+        logger.error(f"Gmail list error: {e}")
+        return []
+
+def get_gmail_content(msg_id):
+    if not gmail_service:
+        return None
+    try:
+        msg = gmail_service.users().messages().get(
+            userId="me", id=msg_id, format="full"
+        ).execute()
+        headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+        body = ""
+        if "parts" in msg["payload"]:
+            for part in msg["payload"]["parts"]:
+                if part["mimeType"] == "text/plain":
+                    data = part["body"].get("data", "")
+                    body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                    break
+        else:
+            data = msg["payload"]["body"].get("data", "")
+            if data:
+                body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+        return {
+            "from": headers.get("From", ""),
+            "subject": headers.get("Subject", ""),
+            "date": headers.get("Date", ""),
+            "body": body[:3000],
+        }
+    except Exception as e:
+        logger.error(f"Gmail read error: {e}")
+        return None
+
+# ── Speech
 def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
     if not speech_service:
         return None
@@ -153,7 +237,7 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
         results = resp.get("results", [])
         if results:
             return " ".join(r["alternatives"][0]["transcript"] for r in results if r.get("alternatives"))
-        return "No speech detected."
+        return "인식 실패"
     except Exception as e:
         logger.error(f"Speech error: {e}")
         return None
@@ -163,32 +247,42 @@ SYSTEM_PROMPT = """당신은 텔레그램에서 동작하는 정진수님의 개
 
 기능:
 1. Google Drive 파일 검색/전송
-2. 이메일 전송 (파일 첨부 가능)
-3. 음성/통화녹음 분석
-4. 웹 검색 (실시간 정보 검색)
-5. 일반 대화 및 업무 지원
+2. Gmail 이메일 전송 (누구한테든 가능, 파일 첨부 포함)
+3. Gmail 이메일 읽기/목록/검색
+4. 음성/통화녹음 분석
+5. 웹 검색 (실시간 정보)
+6. 일반 대화 및 업무 지원
 
 명령 형식:
 - 파일 검색: [DRIVE_SEARCH:검색어]
 - 파일 목록: [DRIVE_LIST]
 - 파일 전송: [DRIVE_SEND:번호]
-- 이메일: [EMAIL:받는주소|제목|본문]
+- 이메일 전송: [EMAIL:받는주소|제목|본문]
 - 파일 첨부 이메일: [EMAIL_WITH_FILE:받는주소|제목|본문|파일번호]
+- 받은 메일 목록: [GMAIL_LIST:검색어]
+- 메일 내용 읽기: [GMAIL_READ:메일번호]
+
+예시:
+- "수입 파일 찾아줘" -> [DRIVE_SEARCH:수입]
+- "1번 보내줘" -> [DRIVE_SEND:1]
+- "korbomb@naver.com에 안녕이라고 보내줘" -> [EMAIL:korbomb@naver.com|안녕|안녕하세요!]
+- "1번 파일 korbomb@naver.com으로 보내줘" -> [EMAIL_WITH_FILE:korbomb@naver.com|파일 전송|파일 보내드립니다.|1]
+- "받은 메일 보여줘" -> [GMAIL_LIST:is:unread]
+- "오늘 받은 메일 보여줘" -> [GMAIL_LIST:newer_than:1d]
+- "김과장 메일 찾아줘" -> [GMAIL_LIST:from:김과장]
+- "1번 메일 내용 읽어줘" -> [GMAIL_READ:1]
 
 중요 규칙:
-- 사용자가 "보내줘", "보내라고", "전송해", "보내", "줘" 등 파일 전송을 요청하면, 가장 최근 검색 결과의 1번 파일을 보내라는 뜻이다. [DRIVE_SEND:1]로 응답하라.
-- 검색 결과가 1개뿐이면 바로 [DRIVE_SEND:1]로 보내라.
-- "이거 메일로 보내줘"라고 하면 이메일 주소를 물어보고, 주소를 받으면 [EMAIL_WITH_FILE:주소|파일 전송|파일 보내드립니다.|1]로 응답하라.
-- 사용자가 어떤 표현을 쓰든 의도를 파악해서 적절한 명령 형식으로 변환하라.
+- 사용자가 "보내줘", "보내라고" 등 전송 요청하면 최근 검색결과 1번을 [DRIVE_SEND:1]로 보내라
+- 사용자가 어떤 표현을 쓰든 의도를 파악해서 명령 형식으로 변환
 - 간결하게 답변
-- 모르면 솔직히 답변
-- 이메일 주소 모르면 물어보기
-- 최신 정보가 필요하면 웹 검색 활용"""
+- 최신 정보는 웹 검색 활용"""
 
 def is_authorized(uid):
     return not ALLOWED_USER_IDS or uid in ALLOWED_USER_IDS
 
 user_search_results = defaultdict(list)
+user_gmail_list = defaultdict(list)
 
 async def ask_claude(user_id, message):
     history = conversation_history[user_id]
@@ -197,23 +291,19 @@ async def ask_claude(user_id, message):
         history[:] = history[-MAX_HISTORY:]
     try:
         r = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
+            model="claude-sonnet-4-6", max_tokens=4096,
             system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
             tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
             messages=history,
         )
-        text_parts = []
-        for block in r.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-        txt = "\n".join(text_parts) if text_parts else "No response."
+        text_parts = [block.text for block in r.content if block.type == "text"]
+        txt = "\n".join(text_parts) if text_parts else "응답 없음"
         history.append({"role": "assistant", "content": r.content})
         return txt
     except anthropic.APIError as e:
         logger.error(f"Claude error: {e}")
         history.pop()
-        return "⚠️ AI error. Please try again."
+        return "⚠️ AI 오류. 잠시 후 다시 시도하세요."
 
 async def cmd_start(update, context):
     u = update.effective_user
@@ -221,30 +311,34 @@ async def cmd_start(update, context):
         await update.message.reply_text("Access denied.")
         return
     d = "✅" if drive_service else "❌"
-    e = "✅" if RESEND_API_KEY else "❌"
+    g = "✅" if gmail_service else "❌"
     s = "✅" if speech_service else "❌"
     await update.message.reply_text(
         f"안녕하세요, {u.first_name}님! 👋\n\n"
-        f"📁 Drive: {d}  📧 이메일: {e}  🎙️ 음성: {s}  🔍 웹검색: ✅\n\n"
-        f"/files - 파일 목록\n/clear - 초기화\n/help - 도움말")
+        f"📁 Drive: {d}  📧 Gmail: {g}  🎙️ 음성: {s}  🔍 웹검색: ✅\n\n"
+        f"/files - 파일 목록\n"
+        f"/mail - 받은 메일 목록\n"
+        f"/clear - 초기화\n"
+        f"/help - 도움말")
 
 async def cmd_clear(update, context):
     uid = update.effective_user.id
     if not is_authorized(uid): return
     conversation_history[uid].clear()
     user_search_results[uid].clear()
+    user_gmail_list[uid].clear()
     await update.message.reply_text("🗑️ 초기화 완료!")
 
 async def cmd_files(update, context):
     uid = update.effective_user.id
     if not is_authorized(uid): return
     if not drive_service:
-        await update.message.reply_text("❌ Drive not connected")
+        await update.message.reply_text("❌ Drive 미연결")
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     files = list_drive_files()
     if not files:
-        await update.message.reply_text("📁 No files")
+        await update.message.reply_text("📁 파일 없음")
         return
     user_search_results[uid] = files
     msg = "📁 파일 목록:\n\n"
@@ -253,14 +347,35 @@ async def cmd_files(update, context):
     msg += "\n💡 번호로 전송/이메일 첨부 가능!"
     await update.message.reply_text(msg)
 
+async def cmd_mail(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid): return
+    if not gmail_service:
+        await update.message.reply_text("❌ Gmail 미연결")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    emails = get_gmail_list(10, "is:unread")
+    if not emails:
+        await update.message.reply_text("📭 읽지 않은 메일 없음")
+        return
+    user_gmail_list[uid] = emails
+    msg = "📬 읽지 않은 메일:\n\n"
+    for i, e in enumerate(emails, 1):
+        sender = e["from"].split("<")[0].strip()[:20]
+        subject = e["subject"][:30]
+        msg += f"{i}. 👤 {sender}\n   📌 {subject}\n\n"
+    msg += "💡 '1번 메일 읽어줘'라고 하세요!"
+    await update.message.reply_text(msg)
+
 async def cmd_help(update, context):
     if not is_authorized(update.effective_user.id): return
     await update.message.reply_text(
         "📖 사용 가이드\n\n"
         "💬 대화: 메시지 보내면 AI 답변\n\n"
         "🔍 검색: '오늘 뉴스', '코스피' 등 실시간 검색\n\n"
-        "📁 파일: '파일 찾아줘', '보내줘', /files\n\n"
-        "📧 이메일: '이거 abc@gmail.com으로 보내줘'\n\n"
+        "📁 파일:\n- '파일 찾아줘 [이름]'\n- '보내줘'\n- /files\n\n"
+        "📧 이메일:\n- 'korbomb@naver.com에 안녕 보내줘'\n- '1번 파일 메일로 보내줘'\n\n"
+        "📬 메일 읽기:\n- /mail 또는 '받은 메일 보여줘'\n- '1번 메일 읽어줘'\n\n"
         "🎙️ 음성: 음성메시지/녹음파일 보내면 자동 분석\n\n"
         "/clear - 초기화")
 
@@ -268,23 +383,17 @@ async def handle_voice(update, context):
     u = update.effective_user
     if not is_authorized(u.id): return
     if not speech_service:
-        await update.message.reply_text("❌ Speech not connected")
+        await update.message.reply_text("❌ 음성 분석 미연결")
         return
     await update.message.reply_text("🎙️ 음성 분석 중...")
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     voice = update.message.voice or update.message.audio
     f = await context.bot.get_file(voice.file_id)
     data = await f.download_as_bytearray()
-    mime = voice.mime_type if voice.mime_type else "audio/ogg"
-    txt = transcribe_audio(bytes(data), mime)
+    txt = transcribe_audio(bytes(data), voice.mime_type or "audio/ogg")
     if txt:
         await update.message.reply_text(f"📝 텍스트:\n\n{txt}")
         analysis = await ask_claude(u.id, f"다음 음성 내용을 분석하고 요약해줘:\n\n{txt}")
-        if len(analysis) > 4096:
-            for i in range(0, len(analysis), 4096):
-                await update.message.reply_text(analysis[i:i+4096])
-        else:
-            await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
+        await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
     else:
         await update.message.reply_text("❌ 음성 인식 실패")
 
@@ -292,28 +401,21 @@ async def handle_audio_file(update, context):
     u = update.effective_user
     if not is_authorized(u.id): return
     if not speech_service:
-        await update.message.reply_text("❌ Speech not connected")
+        await update.message.reply_text("❌ 음성 분석 미연결")
         return
     await update.message.reply_text("🎙️ 오디오 분석 중...")
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     audio = update.message.audio or update.message.document
     f = await context.bot.get_file(audio.file_id)
     data = await f.download_as_bytearray()
-    mime = audio.mime_type if audio.mime_type else "audio/mpeg"
-    txt = transcribe_audio(bytes(data), mime)
+    txt = transcribe_audio(bytes(data), audio.mime_type or "audio/mpeg")
     if txt:
         if len(txt) > 3000:
             for i in range(0, len(txt), 3000):
                 await update.message.reply_text(f"📝 ({i//3000+1}):\n\n{txt[i:i+3000]}")
         else:
             await update.message.reply_text(f"📝 텍스트:\n\n{txt}")
-        analysis = await ask_claude(u.id,
-            f"통화/음성 녹음입니다. 핵심 요약하고 중요 포인트 정리해줘:\n\n{txt}")
-        if len(analysis) > 4096:
-            for i in range(0, len(analysis), 4096):
-                await update.message.reply_text(analysis[i:i+4096])
-        else:
-            await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
+        analysis = await ask_claude(u.id, f"통화/음성 녹음입니다. 핵심 요약하고 중요 포인트 정리해줘:\n\n{txt}")
+        await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
     else:
         await update.message.reply_text("❌ 음성 인식 실패")
 
@@ -355,7 +457,7 @@ async def handle_message(update, context):
             files = user_search_results.get(u.id, [])
             if 0 <= num < len(files):
                 fi = files[num]
-                await update.message.reply_text(f"📤 '{fi['name']}' 다운로드 중...")
+                await update.message.reply_text(f"📤 '{fi['name']}' 전송 중...")
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
                 buf, name = download_drive_file(fi["id"])
                 if buf:
@@ -377,9 +479,9 @@ async def handle_message(update, context):
                 await update.message.reply_text(f"📧 '{fi['name']}' 첨부하여 전송 중...")
                 buf, name = download_drive_file(fi["id"])
                 if buf:
-                    ok, msg = send_email(to_addr, subject, body, buf, name)
+                    ok, msg = send_gmail(to_addr, subject, body, buf, name)
                     if ok:
-                        await update.message.reply_text(f"✅ {to_addr}로 이메일 전송 완료!")
+                        await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
                     else:
                         await update.message.reply_text(f"❌ 전송 실패: {msg}")
                 else:
@@ -394,14 +496,58 @@ async def handle_message(update, context):
         try:
             parts = resp.split("[EMAIL:")[1].split("]")[0].split("|")
             to_addr, subject, body = parts[0], parts[1], parts[2]
-            ok, msg = send_email(to_addr, subject, body)
+            await update.message.reply_text(f"📧 {to_addr}로 전송 중...")
+            ok, msg = send_gmail(to_addr, subject, body)
             if ok:
-                await update.message.reply_text(f"✅ {to_addr}로 이메일 전송 완료!")
+                await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
             else:
                 await update.message.reply_text(f"❌ 전송 실패: {msg}")
         except Exception as e:
             logger.error(f"Email error: {e}")
             await update.message.reply_text("❌ 이메일 전송 실패")
+
+    elif "[GMAIL_LIST:" in resp:
+        query = resp.split("[GMAIL_LIST:")[1].split("]")[0]
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        emails = get_gmail_list(10, query)
+        if emails:
+            user_gmail_list[u.id] = emails
+            msg = "📬 메일 목록:\n\n"
+            for i, e in enumerate(emails, 1):
+                sender = e["from"].split("<")[0].strip()[:20]
+                subject = e["subject"][:30]
+                msg += f"{i}. 👤 {sender}\n   📌 {subject}\n\n"
+            msg += "💡 '1번 메일 읽어줘'라고 하세요!"
+            await update.message.reply_text(msg)
+        else:
+            await update.message.reply_text("📭 메일 없음")
+
+    elif "[GMAIL_READ:" in resp:
+        try:
+            num = int(resp.split("[GMAIL_READ:")[1].split("]")[0]) - 1
+            emails = user_gmail_list.get(u.id, [])
+            if 0 <= num < len(emails):
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+                content = get_gmail_content(emails[num]["id"])
+                if content:
+                    msg = f"📧 메일 내용\n\n"
+                    msg += f"👤 보낸사람: {content['from']}\n"
+                    msg += f"📌 제목: {content['subject']}\n"
+                    msg += f"📅 날짜: {content['date']}\n\n"
+                    msg += f"📝 내용:\n{content['body']}"
+                    if len(msg) > 4096:
+                        for i in range(0, len(msg), 4096):
+                            await update.message.reply_text(msg[i:i+4096])
+                    else:
+                        await update.message.reply_text(msg)
+                    summary = await ask_claude(u.id, f"이 메일 내용을 간단히 요약해줘:\n{content['body']}")
+                    await update.message.reply_text(f"🔍 요약: {summary}")
+                else:
+                    await update.message.reply_text("❌ 메일 읽기 실패")
+            else:
+                await update.message.reply_text("❌ 잘못된 번호")
+        except:
+            await update.message.reply_text("❌ 번호 확인 필요")
 
     else:
         if len(resp) > 4096:
@@ -415,6 +561,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("files", cmd_files))
+    app.add_handler(CommandHandler("mail", cmd_mail))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.AUDIO, handle_audio_file))
@@ -423,7 +570,7 @@ def main():
         filters.Document.MimeType("audio/ogg") | filters.Document.MimeType("audio/wav") |
         filters.Document.MimeType("audio/x-m4a"), handle_audio_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Bot started! (Drive + Email + Speech + Web Search)")
+    logger.info("Bot started! (Drive + Gmail + Speech + Web Search)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
