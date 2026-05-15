@@ -564,7 +564,51 @@ INSTAGRAM_SYSTEM_PROMPT = """당신은 SNS 마케팅 13년차 전문가의 인�
 ---
 💡 이 초안의 포인트: (왜 이렇게 썼는지 한 줄 설명)"""
 
+MARKETING_SYSTEM_PROMPT = """당신은 SNS 마케팅 13년 경력의 마케터입니다.
+이미지를 마케터 관점에서 분석하고 실무적인 피드백을 제공합니다.
+
+분석 관점:
+1. 타겟 오디언스 - 누가 이 콘텐츠를 봐야 하는가
+2. 메시지 명확성 - 핵심 메시지가 즉시 전달되는가
+3. 클릭/전환 유도 - CTA가 있는가, 행동을 유도하는가
+4. 브랜드 일관성 - 브랜드 톤앤매너와 맞는가
+5. 경쟁력 - 비슷한 콘텐츠 대비 차별점이 있는가
+6. 개선 제안 - 마케팅 성과를 높이기 위한 구체적 액션
+
+출력 형식:
+🎯 타겟 분석
+📢 메시지 전달력
+🔥 강점
+⚠️ 개선 포인트
+📈 마케팅 성과를 높이는 제안"""
+
 INSTAGRAM_KEYWORDS = {"인스타", "캡션", "게시물", "피드"}
+ANALYSIS_KEYWORDS = {"분석", "피드백", "인스타", "캡션", "마케팅", "마케터", "평가", "리뷰", "봐줘", "어때"}
+
+def _select_image_prompt(text):
+    if any(kw in text for kw in ("인스타", "캡션", "게시물")):
+        return INSTAGRAM_SYSTEM_PROMPT, text or "이 이미지를 바탕으로 인스타그램 게시물 초안을 작성해주세요"
+    elif any(kw in text for kw in ("마케팅", "마케터")):
+        return MARKETING_SYSTEM_PROMPT, text or "마케터 관점에서 이 이미지를 분석해주세요"
+    else:
+        return IMAGE_SYSTEM_PROMPT, text or "이 디자인을 전문적으로 분석하고 피드백해주세요"
+
+async def _call_vision(b64, mime_type, system_prompt, prompt, update):
+    r = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=4096,
+        system=system_prompt,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
+            {"type": "text", "text": prompt},
+        ]}],
+    )
+    result = r.content[0].text if r.content else "분석 결과 없음"
+    if len(result) > 4096:
+        for i in range(0, len(result), 4096):
+            await update.message.reply_text(result[i:i+4096])
+    else:
+        await update.message.reply_text(result)
 
 def is_authorized(uid):
     return not ALLOWED_USER_IDS or uid in ALLOWED_USER_IDS
@@ -572,6 +616,7 @@ def is_authorized(uid):
 user_search_results = defaultdict(list)
 user_gmail_list = defaultdict(list)
 user_last_action = defaultdict(dict)
+user_last_photo = {}
 
 async def ask_claude(user_id, message):
     history = conversation_history[user_id]
@@ -660,6 +705,7 @@ async def cmd_clear(update, context):
     user_search_results[uid].clear()
     user_gmail_list[uid].clear()
     user_last_action[uid].clear()
+    user_last_photo.pop(uid, None)
     await update.message.reply_text("🗑️ 초기화 완료!")
 
 async def cmd_memo(update, context):
@@ -795,12 +841,6 @@ async def handle_photo(update, context):
         return
 
     try:
-        caption = update.message.caption or ""
-        is_instagram = any(kw in caption for kw in INSTAGRAM_KEYWORDS)
-
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-        await update.message.reply_text("📱 인스타그램 초안 작성 중..." if is_instagram else "🖼️ 이미지 분석 중...")
-
         if update.message.photo:
             file_id = update.message.photo[-1].file_id
             mime_type = "image/jpeg"
@@ -818,37 +858,19 @@ async def handle_photo(update, context):
             await update.message.reply_text("❌ 이미지 다운로드 실패")
             return
 
-        if is_instagram:
-            system_prompt = INSTAGRAM_SYSTEM_PROMPT
-            prompt = caption.strip() if caption.strip() else "이 이미지를 바탕으로 인스타그램 게시물 초안을 작성해주세요"
-        else:
-            system_prompt = IMAGE_SYSTEM_PROMPT
-            prompt = caption.strip() if caption.strip() else "이 디자인을 전문적으로 분석하고 피드백해주세요"
+        user_last_photo[u.id] = {"b64": b64, "mime_type": mime_type}
 
-        try:
-            r = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=4096,
-                system=system_prompt,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
-                        {"type": "text", "text": prompt},
-                    ],
-                }],
+        caption = (update.message.caption or "").strip()
+        if caption:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+            system_prompt, prompt = _select_image_prompt(caption)
+            await _call_vision(b64, mime_type, system_prompt, prompt, update)
+            user_last_photo.pop(u.id, None)
+        else:
+            await update.message.reply_text(
+                "📸 이미지 수신 완료! 분석 방법을 말씀해주세요.\n"
+                "예: 디자인 피드백, 인스타 캡션, 마케팅 분석"
             )
-            result = r.content[0].text if r.content else "분석 결과 없음"
-        except anthropic.APIError as e:
-            logger.error(f"Claude vision error: {e}")
-            await update.message.reply_text("⚠️ AI 오류. 잠시 후 다시 시도하세요.")
-            return
-
-        if len(result) > 4096:
-            for i in range(0, len(result), 4096):
-                await update.message.reply_text(result[i:i+4096])
-        else:
-            await update.message.reply_text(result)
 
     except Exception as e:
         logger.error(f"handle_photo error: {e}")
@@ -859,8 +881,23 @@ async def handle_message(update, context):
     if not is_authorized(u.id):
         await update.message.reply_text("Access denied.")
         return
+
+    text = update.message.text or ""
+
+    # 이전에 받은 이미지 + 분석 키워드 감지 → vision 호출
+    if u.id in user_last_photo and any(kw in text for kw in ANALYSIS_KEYWORDS):
+        photo_data = user_last_photo.pop(u.id)
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        try:
+            system_prompt, prompt = _select_image_prompt(text)
+            await _call_vision(photo_data["b64"], photo_data["mime_type"], system_prompt, text, update)
+        except Exception as e:
+            logger.error(f"Vision from message error: {e}")
+            await update.message.reply_text(f"❌ 이미지 분석 오류: {e}")
+        return
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    resp = await ask_claude(u.id, update.message.text)
+    resp = await ask_claude(u.id, text)
 
     if "[REPEAT_LAST]" in resp:
         last = user_last_action.get(u.id, {})
