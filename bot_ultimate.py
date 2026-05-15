@@ -575,7 +575,7 @@ async def ask_claude(user_id, message):
 
     try:
         r = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=4096,
             system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
             tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
@@ -585,11 +585,7 @@ async def ask_claude(user_id, message):
         txt = "\n".join(text_parts) if text_parts else "응답 없음"
 
         # assistant 응답을 content 블록 리스트로 저장
-        assistant_content = [
-            {"type": b.type, "text": b.text} if b.type == "text" else {"type": b.type}
-            for b in r.content
-        ]
-        db_add_message(user_id, "assistant", assistant_content)
+       db_add_message(user_id, "assistant", txt)
         return txt
     except anthropic.APIError as e:
         logger.error(f"Claude error: {e}")
