@@ -7,12 +7,14 @@ from datetime import datetime
 from collections import defaultdict
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import anthropic
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+import psycopg2
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -26,6 +28,7 @@ GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,6 +36,90 @@ logger = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 conversation_history = defaultdict(list)
 MAX_HISTORY = 20
+
+# ── DB 초기화
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
+
+def init_db():
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memos (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                content TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_logs (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                role TEXT,
+                content TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("DB initialized!")
+    except Exception as e:
+        logger.error(f"DB init error: {e}")
+
+def save_memo(user_id, content):
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO memos (user_id, content) VALUES (%s, %s)", (user_id, content))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Memo save error: {e}")
+
+def get_memos(user_id, limit=10):
+    if not DATABASE_URL:
+        return []
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT content, created_at FROM memos WHERE user_id=%s ORDER BY created_at DESC LIMIT %s", (user_id, limit))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"Memo get error: {e}")
+        return []
+
+def delete_memo(user_id, memo_id):
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM memos WHERE user_id=%s AND id=%s", (user_id, memo_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Memo delete error: {e}")
+
+def get_memos_for_prompt(user_id):
+    memos = get_memos(user_id, 5)
+    if not memos:
+        return ""
+    text = "\n[저장된 메모]\n"
+    for content, created_at in memos:
+        text += f"- {content} ({created_at.strftime('%m/%d')})\n"
+    return text
 
 # ── Google Drive + Speech
 drive_service = None
@@ -135,20 +222,17 @@ def download_drive_file(file_id):
         logger.error(f"Drive download error: {e}")
         return None, None
 
-# ── Gmail send (토큰 자동갱신 + 한글 인코딩 수정)
+# ── Gmail send
 def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
     if not gmail_service or not gmail_creds:
         return False, "Gmail not connected"
     try:
-        # 토큰 자동 갱신
         gmail_creds.refresh(Request())
-
         msg = MIMEMultipart()
         msg["From"] = GMAIL_ADDRESS
         msg["To"] = to_addr
         msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain", "utf-8"))  # 한글 본문 인코딩
-
+        msg.attach(MIMEText(body, "plain", "utf-8"))
         if attach_buf and attach_name:
             attach_buf.seek(0)
             part = MIMEBase("application", "octet-stream")
@@ -157,10 +241,9 @@ def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
             part.add_header(
                 "Content-Disposition",
                 "attachment",
-                filename=("utf-8", "", attach_name)  # 한글 파일명 인코딩
+                filename=("utf-8", "", attach_name)
             )
             msg.attach(part)
-
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
         gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
         return True, "OK"
@@ -225,7 +308,7 @@ def get_gmail_content(msg_id):
         logger.error(f"Gmail read error: {e}")
         return None
 
-# ── Speech (확장자 + 한국어 모델)
+# ── Speech
 def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
     if not speech_service:
         return None
@@ -233,53 +316,53 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
         from pydub import AudioSegment
 
         ext_map = {
-            "audio/ogg": ".ogg",
-            "audio/mpeg": ".mp3",
-            "audio/mp3": ".mp3",
-            "audio/mp4": ".m4a",
-            "audio/x-m4a": ".m4a",
-            "audio/m4a": ".m4a",
-            "audio/wav": ".wav",
-            "audio/x-wav": ".wav",
-            "video/mp4": ".mp4",
+            "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+            "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/m4a": ".m4a",
+            "audio/wav": ".wav", "audio/x-wav": ".wav", "video/mp4": ".mp4",
         }
         ext = ext_map.get(mime_type, ".mp3")
 
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
             f.write(audio_bytes)
             tmp_in = f.name
-        tmp_out = tmp_in + ".wav"
 
         audio = AudioSegment.from_file(tmp_in)
         audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        audio.export(tmp_out, format="wav")
-
-        with open(tmp_out, "rb") as f:
-            wav_bytes = f.read()
-
         os.unlink(tmp_in)
-        os.unlink(tmp_out)
 
-        body = {
-            "config": {
-                "encoding": "LINEAR16",
-                "sampleRateHertz": 16000,
-                "languageCode": "ko-KR",
-                "alternativeLanguageCodes": ["en-US"],
-                "enableAutomaticPunctuation": True,
-                "model": "latest_long",
-                "useEnhanced": True,
-            },
-            "audio": {"content": base64.b64encode(wav_bytes).decode("utf-8")},
-        }
-        resp = speech_service.speech().recognize(body=body).execute()
-        results = resp.get("results", [])
-        if results:
-            return " ".join(
-                r["alternatives"][0]["transcript"]
-                for r in results if r.get("alternatives")
-            )
-        return "음성 인식 결과 없음"
+        chunk_ms = 55 * 1000
+        chunks = [audio[i:i+chunk_ms] for i in range(0, len(audio), chunk_ms)]
+
+        full_transcript = []
+        for chunk in chunks:
+            tmp_out = tempfile.mktemp(suffix=".wav")
+            chunk.export(tmp_out, format="wav")
+            with open(tmp_out, "rb") as f:
+                wav_bytes = f.read()
+            os.unlink(tmp_out)
+
+            body = {
+                "config": {
+                    "encoding": "LINEAR16",
+                    "sampleRateHertz": 16000,
+                    "languageCode": "ko-KR",
+                    "alternativeLanguageCodes": ["en-US"],
+                    "enableAutomaticPunctuation": True,
+                    "model": "latest_long",
+                    "useEnhanced": True,
+                },
+                "audio": {"content": base64.b64encode(wav_bytes).decode("utf-8")},
+            }
+            resp = speech_service.speech().recognize(body=body).execute()
+            results = resp.get("results", [])
+            if results:
+                text = " ".join(
+                    r["alternatives"][0]["transcript"]
+                    for r in results if r.get("alternatives")
+                )
+                full_transcript.append(text)
+
+        return " ".join(full_transcript) if full_transcript else "음성 인식 결과 없음"
     except Exception as e:
         logger.error(f"Speech error: {e}")
         return None
@@ -288,10 +371,48 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 텔레그램으로 소통하며 실제 비서처럼 판단하고 행동합니다.
 
 ━━━━━━━━━━━━━━━━━━━━━━━
+⚙️ 현재 세팅 상태
+━━━━━━━━━━━━━━━━━━━━━━━
+- Railway 서버에서 24시간 운영 중
+- Gmail API 연동 완료 (jungjinsu86@gmail.com)
+- Google Drive 연동 완료
+- 텔레그램 봇 운영 중 (@jinsoo_biseo_bot)
+- 웹 검색 가능
+- 음성 분석 가능 (m4a, mp3 등)
+- PostgreSQL DB 연동 (메모 저장 가능)
+- 30분마다 새 메일 자동 체크 중
+
+→ 서버, API 연동 등 이미 다 세팅되어 있음
+→ "설정이 필요하다", "서버가 있어야 한다" 같은 말 하지 말 것
+→ 기능 요청이 오면 바로 어떻게 추가할지만 말하면 됨
+
+━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ 절대 규칙 (위반 금지)
+━━━━━━━━━━━━━━━━━━━━━━━
+- 절대로 "저는 Claude AI입니다"라고 밝히지 마세요
+- 절대로 "Drive/Gmail에 접근할 수 없습니다"라고 말하지 마세요
+- 절대로 "봇 서버 담당자에게 확인하세요"라고 하지 마세요
+- [DRIVE_SEARCH:검색어]를 출력하면 시스템이 자동으로 Drive를 검색합니다
+- [EMAIL:주소|제목|본문]을 출력하면 시스템이 자동으로 이메일을 보냅니다
+- 명령 형식을 출력하는 것 자체가 실행입니다
+- 요청이 오면 무조건 해당 명령 형식으로 응답하세요
+
+━━━━━━━━━━━━━━━━━━━━━━━
+👤 보스 정보
+━━━━━━━━━━━━━━━━━━━━━━━
+이름: 정진수
+직업: SNS 13년차강사 / 강연자 / 13권의 책 집필
+주요 업무: 강의, 출강, SNS 마케팅 컨설팅
+주요 거래처: 월천사, 각종 기업 출강
+이메일: jungjinsu86@gmail.com
+주요 연락처:
+- korbomb@naver.com (자주 보내는 곳)
+자주 쓰는 파일: 강의안, 수입, 출강 의뢰서
+
+━━━━━━━━━━━━━━━━━━━━━━━
 🧠 핵심 원칙
 ━━━━━━━━━━━━━━━━━━━━━━━
 - 항상 대표님 입장에서 가장 빠르고 편한 방법으로 처리
-- 호칭은 보스 라고 부르기
 - 짧고 명확하게. 불필요한 말 절대 금지
 - 모호하면 한 가지만 물어보고 바로 처리
 - 실패해도 이유를 한 줄로만 설명하고 대안 제시
@@ -305,8 +426,9 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 2. Gmail - 누구에게든 전송, 파일 첨부, 받은 메일 읽기/검색/요약
 3. 음성/통화녹음 - m4a, mp3 등 자동 텍스트 변환 + AI 요약
 4. 웹 검색 - 실시간 뉴스, 날씨, 주가, 인물, 기업 정보
-5. 문서 작성 - 이메일 초안, 보고서, 아이디어 정리
-6. 일반 대화 및 업무 조언
+5. 메모 저장/조회 - /memo 로 저장, /memos 로 조회
+6. 문서 작성 - 이메일 초안, 보고서, 아이디어 정리
+7. 일반 대화 및 업무 조언
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 📋 명령 형식
@@ -325,85 +447,48 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 ━━━━━━━━━━━━━━━━━━━━━━━
 검색 트리거:
 "찾아줘", "어딨어", "검색해", "있어?" → [DRIVE_SEARCH:핵심단어]
-핵심단어 추출 예시:
-- "수입 관련 엑셀 파일 찾아줘" → [DRIVE_SEARCH:수입]
-- "이호동 대표 미팅 자료" → [DRIVE_SEARCH:이호동]
-- "작년에 만든 강의안" → [DRIVE_SEARCH:강의안]
 
 전송 트리거:
-"줘", "보내줘", "전송해", "받고싶어", "다운로드", "보내라고",
-"그거줘", "이거줘", "아까그거", "방금그거"
+"줘", "보내줘", "전송해", "받고싶어", "보내라고",
+"그거줘", "이거줘", "아까그거"
 → 직전 검색결과 1번을 [DRIVE_SEND:1]
 
 번호 지정:
-"2번", "두번째", "뒤에꺼", "마지막꺼" → 해당 번호로 처리
-결과가 1개뿐이면 → 바로 [DRIVE_SEND:1] (확인 없이)
+"2번", "두번째" → 해당 번호로 처리
+결과가 1개뿐이면 → 바로 [DRIVE_SEND:1]
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 🔄 반복 작업 규칙
 ━━━━━━━━━━━━━━━━━━━━━━━
-"다시", "또", "한번 더", "재전송", "다시 보내줘", "또 보내줘"
-→ [REPEAT_LAST] (직전 작업 그대로 반복)
+"다시", "또", "한번 더", "재전송" → [REPEAT_LAST]
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 📧 이메일 전송 규칙
 ━━━━━━━━━━━━━━━━━━━━━━━
 주소 없을 때: 반드시 먼저 물어보기
 주소 있을 때: 제목/본문이 없어도 문맥에서 추론해서 작성
-
-제목/본문 자동 생성 기준:
-- "안녕이라고 보내줘" → 제목: 안녕, 본문: 안녕하세요!
-- "미팅 일정 조율 메일 보내줘" → 적절한 비즈니스 메일 작성
-- "이 파일 보내줘" → 제목: 파일 전달드립니다, 본문: 파일 첨부하여 보내드립니다
-
-파일 첨부:
-"파일도 같이", "첨부해서", "붙여서" → [EMAIL_WITH_FILE] 사용
-파일 번호 불명확 시 최근 검색 1번 사용
+파일 첨부: "첨부해서", "붙여서" → [EMAIL_WITH_FILE] 사용
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 📬 메일 읽기 규칙
 ━━━━━━━━━━━━━━━━━━━━━━━
-"메일 확인", "받은 메일", "메일 뭐 있어" → [GMAIL_LIST:is:unread]
+"메일 확인", "받은 메일" → [GMAIL_LIST:is:unread]
 "오늘 온 메일" → [GMAIL_LIST:newer_than:1d]
-"이번 주 메일" → [GMAIL_LIST:newer_than:7d]
 "○○한테서 온 메일" → [GMAIL_LIST:from:○○]
-"○○ 관련 메일" → [GMAIL_LIST:subject:○○]
-"안 읽은 것만" → [GMAIL_LIST:is:unread]
-"중요한 메일" → [GMAIL_LIST:is:starred]
-
-목록 표시 후:
-"1번", "첫번째꺼", "위에꺼", "그거" → [GMAIL_READ:1]
-"읽어줘", "내용봐줘", "요약해줘" → [GMAIL_READ:1] 후 AI 요약
+"1번 메일 읽어줘" → [GMAIL_READ:1]
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 🔍 웹 검색 규칙
 ━━━━━━━━━━━━━━━━━━━━━━━
-자동 검색 상황:
-- 오늘/최신 뉴스, 날씨, 주가, 환율
-- 모르는 사람/기업/장소
-- "요즘", "최근", "지금" 이 들어간 질문
-- 법률, 제도, 정책 관련 (최신 정보 필요)
-
-검색 결과 정리 방식:
-- 핵심 3줄 요약
-- 출처 1개만 표시
-- 추가 궁금한 점 있으면 물어보도록 유도
+최신 정보, 뉴스, 날씨, 주가, 모르는 사람/기업 → 자동 웹 검색
+핵심 3줄 요약, 출처 1개만 표시
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 🧩 맥락 파악 규칙
 ━━━━━━━━━━━━━━━━━━━━━━━
 - "그거", "이거", "아까 말한 거" → 직전 대화 내용 참조
-- 연속 작업 시 흐름 유지 (검색 → 전송 → 이메일 순서)
-- 대화가 끊겼다가 재개되면 새로운 요청으로 처리
-- 파일명, 이름, 날짜 등 구체적인 정보는 정확히 기억해서 활용
-
-━━━━━━━━━━━━━━━━━━━━━━━
-⚡ 빠른 처리 우선순위
-━━━━━━━━━━━━━━━━━━━━━━━
-1. 명확한 요청 → 바로 명령 형식으로 처리
-2. 약간 모호한 요청 → 가장 합리적인 방향으로 처리 후 맞는지 확인
-3. 완전히 모호한 요청 → 핵심 1가지만 물어보고 처리
-4. 기능 밖의 요청 → 솔직히 말하고 가능한 대안 제시
+- 연속 작업 시 흐름 유지
+- 파일명, 이름, 날짜 등 정확히 기억해서 활용
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 🚫 절대 금지
@@ -412,36 +497,89 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 - 할 수 없는 것을 할 수 있다고 대답
 - 불필요한 긴 답변
 - "죄송합니다" 남발
+- **굵은 글씨** 남발 (텔레그램에서 **이렇게** 보임)
 - 확인되지 않은 정보를 사실처럼 말하기
-- 작업 전 과도한 설명"""
+
+━━━━━━━━━━━━━━━━━━━━━━━
+💬 대화 예시 (이 스타일로 말해)
+━━━━━━━━━━━━━━━━━━━━━━━
+질문: 수입 파일 찾아줘
+답변: [DRIVE_SEARCH:수입]
+
+질문: 됐어?
+답변: 네, 완료됐어요.
+
+질문: 이게 뭐야?
+답변: Google Speech API 오류예요. 포맷이 안 맞아서 그런 거고, 코드 한 줄 바꾸면 돼요.
+
+질문: 왜 안돼?
+답변: Railway가 SMTP 포트를 막아서요. Resend 쓰면 해결돼요.
+
+질문: 오늘 날씨 어때?
+답변: [웹 검색 후] 의왕시 오늘 23도, 맑아요.
+
+질문: 메일 확인해줘
+답변: [GMAIL_LIST:is:unread]
+
+질문: 다시 보내줘
+답변: [REPEAT_LAST]
+
+규칙: 위 예시처럼 짧고 자연스럽게.
+불필요한 설명, 형식적인 인사, 굵은 글씨 쓰지 말 것."""
 
 def is_authorized(uid):
     return not ALLOWED_USER_IDS or uid in ALLOWED_USER_IDS
 
 user_search_results = defaultdict(list)
 user_gmail_list = defaultdict(list)
-user_last_action = defaultdict(dict)  # 마지막 작업 기억
+user_last_action = defaultdict(dict)
+last_mail_ids = set()
 
 async def ask_claude(user_id, message):
     history = conversation_history[user_id]
+    memos = get_memos_for_prompt(user_id)
+    system = SYSTEM_PROMPT + memos
+
     history.append({"role": "user", "content": f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}]\n{message}"})
     if len(history) > MAX_HISTORY:
         history[:] = history[-MAX_HISTORY:]
     try:
         r = client.messages.create(
             model="claude-sonnet-4-6", max_tokens=4096,
-            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
             messages=history,
         )
         text_parts = [block.text for block in r.content if block.type == "text"]
         txt = "\n".join(text_parts) if text_parts else "응답 없음"
-        history.append({"role": "assistant", "content": r.content})
+        # 텍스트만 저장 (토큰 절약)
+        history.append({"role": "assistant", "content": txt})
         return txt
     except anthropic.APIError as e:
         logger.error(f"Claude error: {e}")
         history.pop()
         return "⚠️ AI 오류. 잠시 후 다시 시도하세요."
+
+# ── Gmail 자동 체크 (30분마다)
+async def check_new_gmail(app):
+    global last_mail_ids
+    if not gmail_service or not ALLOWED_USER_IDS:
+        return
+    try:
+        emails = get_gmail_list(10, "is:unread newer_than:1h")
+        new_ids = {e["id"] for e in emails}
+        truly_new = new_ids - last_mail_ids
+        if last_mail_ids and truly_new:
+            for e in emails:
+                if e["id"] in truly_new:
+                    sender = e["from"].split("<")[0].strip()[:20]
+                    subject = e["subject"][:30]
+                    msg = f"📬 새 메일 왔어요!\n\n👤 {sender}\n📌 {subject}"
+                    for uid in ALLOWED_USER_IDS:
+                        await app.bot.send_message(chat_id=uid, text=msg)
+        last_mail_ids = new_ids
+    except Exception as e:
+        logger.error(f"Gmail check error: {e}")
 
 async def cmd_start(update, context):
     u = update.effective_user
@@ -451,11 +589,15 @@ async def cmd_start(update, context):
     d = "✅" if drive_service else "❌"
     g = "✅" if gmail_service else "❌"
     s = "✅" if speech_service else "❌"
+    db = "✅" if DATABASE_URL else "❌"
     await update.message.reply_text(
-        f"보스, 안녕하세요! 👋\n\n"
-        f"📁 Drive: {d}  📧 Gmail: {g}  🎙️ 음성: {s}  🔍 웹검색: ✅\n\n"
+        f"안녕하세요! 👋\n\n"
+        f"📁 Drive: {d}  📧 Gmail: {g}  🎙️ 음성: {s}\n"
+        f"🔍 웹검색: ✅  🗄️ DB: {db}\n\n"
         f"/files - 파일 목록\n"
-        f"/mail - 받은 메일 목록\n"
+        f"/mail - 받은 메일\n"
+        f"/memo [내용] - 메모 저장\n"
+        f"/memos - 메모 목록\n"
         f"/clear - 초기화\n"
         f"/help - 도움말")
 
@@ -467,6 +609,28 @@ async def cmd_clear(update, context):
     user_gmail_list[uid].clear()
     user_last_action[uid].clear()
     await update.message.reply_text("🗑️ 초기화 완료!")
+
+async def cmd_memo(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid): return
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("사용법: /memo [저장할 내용]")
+        return
+    save_memo(uid, text)
+    await update.message.reply_text(f"✅ 메모 저장됨: {text}")
+
+async def cmd_memos(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid): return
+    memos = get_memos(uid, 10)
+    if not memos:
+        await update.message.reply_text("저장된 메모 없음")
+        return
+    msg = "📝 저장된 메모:\n\n"
+    for i, (content, created_at) in enumerate(memos, 1):
+        msg += f"{i}. {content} ({created_at.strftime('%m/%d %H:%M')})\n"
+    await update.message.reply_text(msg)
 
 async def cmd_files(update, context):
     uid = update.effective_user.id
@@ -510,13 +674,14 @@ async def cmd_help(update, context):
     if not is_authorized(update.effective_user.id): return
     await update.message.reply_text(
         "📖 사용 가이드\n\n"
-        "💬 대화: 메시지 보내면 AI 답변\n\n"
-        "🔍 검색: '오늘 뉴스', '코스피' 등 실시간 검색\n\n"
-        "📁 파일:\n- '파일 찾아줘 [이름]'\n- '보내줘'\n- /files\n\n"
-        "📧 이메일:\n- 'abc@gmail.com에 안녕 보내줘'\n- '1번 파일 메일로 보내줘'\n\n"
-        "📬 메일 읽기:\n- /mail 또는 '받은 메일 보여줘'\n- '1번 메일 읽어줘'\n\n"
-        "🎙️ 음성: 음성메시지/m4a/mp3 보내면 자동 분석\n\n"
-        "🔄 다시 보내기: '다시', '또 보내줘'\n\n"
+        "💬 대화: 메시지 보내면 AI 답변\n"
+        "🔍 검색: '오늘 뉴스', '코스피' 등\n"
+        "📁 파일: '파일 찾아줘', '보내줘', /files\n"
+        "📧 이메일: 'abc@gmail.com에 안녕 보내줘'\n"
+        "📬 메일: /mail, '받은 메일 보여줘'\n"
+        "🎙️ 음성: 음성/m4a 파일 보내면 자동 분석\n"
+        "📝 메모: /memo [내용], /memos\n"
+        "🔄 반복: '다시 보내줘'\n\n"
         "/clear - 초기화")
 
 async def handle_voice(update, context):
@@ -525,7 +690,7 @@ async def handle_voice(update, context):
     if not speech_service:
         await update.message.reply_text("❌ 음성 분석 미연결")
         return
-    await update.message.reply_text("🎙️ 음성 분석 중...")
+    await update.message.reply_text("🎙️ 분석 중...")
     voice = update.message.voice or update.message.audio
     f = await context.bot.get_file(voice.file_id)
     data = await f.download_as_bytearray()
@@ -533,11 +698,7 @@ async def handle_voice(update, context):
     if txt:
         await update.message.reply_text(f"📝 텍스트:\n\n{txt}")
         analysis = await ask_claude(u.id, f"다음 음성 내용을 분석하고 요약해줘:\n\n{txt}")
-        if len(analysis) > 4096:
-            for i in range(0, len(analysis), 4096):
-                await update.message.reply_text(analysis[i:i+4096])
-        else:
-            await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
+        await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
     else:
         await update.message.reply_text("❌ 음성 인식 실패")
 
@@ -547,12 +708,11 @@ async def handle_audio_file(update, context):
     if not speech_service:
         await update.message.reply_text("❌ 음성 분석 미연결")
         return
-    await update.message.reply_text("🎙️ 오디오 분석 중... (잠시 기다려주세요)")
+    await update.message.reply_text("🎙️ 분석 중... (잠시 기다려주세요)")
     audio = update.message.audio or update.message.document
     f = await context.bot.get_file(audio.file_id)
     data = await f.download_as_bytearray()
-    mime = audio.mime_type or "audio/mpeg"
-    txt = transcribe_audio(bytes(data), mime)
+    txt = transcribe_audio(bytes(data), audio.mime_type or "audio/mpeg")
     if txt:
         if len(txt) > 3000:
             for i in range(0, len(txt), 3000):
@@ -561,43 +721,9 @@ async def handle_audio_file(update, context):
             await update.message.reply_text(f"📝 텍스트:\n\n{txt}")
         analysis = await ask_claude(u.id,
             f"통화/음성 녹음입니다. 핵심 요약하고 중요 포인트 정리해줘:\n\n{txt}")
-        if len(analysis) > 4096:
-            for i in range(0, len(analysis), 4096):
-                await update.message.reply_text(analysis[i:i+4096])
-        else:
-            await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
+        await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
     else:
         await update.message.reply_text("❌ 음성 인식 실패")
-
-async def do_send_file(update, context, file_id, file_name):
-    """파일 전송 공통 함수"""
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
-    buf, name = download_drive_file(file_id)
-    if buf:
-        await update.message.reply_document(document=buf, filename=name, caption=f"📄 {name}")
-        return True
-    else:
-        await update.message.reply_text("❌ 다운로드 실패")
-        return False
-
-async def do_send_email(update, to_addr, subject, body, file_id=None, file_name=None):
-    """이메일 전송 공통 함수"""
-    if file_id:
-        buf, name = download_drive_file(file_id)
-        if buf:
-            ok, msg = send_gmail(to_addr, subject, body, buf, name)
-        else:
-            await update.message.reply_text("❌ 파일 다운로드 실패")
-            return False
-    else:
-        ok, msg = send_gmail(to_addr, subject, body)
-
-    if ok:
-        await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
-        return True
-    else:
-        await update.message.reply_text(f"❌ 전송 실패: {msg}")
-        return False
 
 async def handle_message(update, context):
     u = update.effective_user
@@ -607,22 +733,28 @@ async def handle_message(update, context):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     resp = await ask_claude(u.id, update.message.text)
 
-    # ── 직전 작업 반복
     if "[REPEAT_LAST]" in resp:
         last = user_last_action.get(u.id, {})
         if not last:
-            await update.message.reply_text("❌ 반복할 이전 작업이 없습니다.")
+            await update.message.reply_text("반복할 이전 작업이 없어요.")
             return
         if last["type"] == "file":
             await update.message.reply_text(f"📤 '{last['name']}' 다시 전송 중...")
-            await do_send_file(update, context, last["file_id"], last["name"])
+            buf, name = download_drive_file(last["file_id"])
+            if buf:
+                await update.message.reply_document(document=buf, filename=name, caption=f"📄 {name}")
         elif last["type"] == "email":
             await update.message.reply_text(f"📧 {last['to']}로 다시 전송 중...")
-            await do_send_email(update, last["to"], last["subject"], last["body"],
-                                last.get("file_id"), last.get("file_name"))
+            buf = None
+            if last.get("file_id"):
+                buf, _ = download_drive_file(last["file_id"])
+            ok, msg = send_gmail(last["to"], last["subject"], last["body"], buf, last.get("file_name"))
+            if ok:
+                await update.message.reply_text(f"✅ {last['to']}로 전송 완료!")
+            else:
+                await update.message.reply_text(f"❌ 전송 실패: {msg}")
         return
 
-    # ── Drive 검색
     if "[DRIVE_SEARCH:" in resp:
         kw = resp.split("[DRIVE_SEARCH:")[1].split("]")[0]
         files = search_drive_files(kw)
@@ -634,7 +766,7 @@ async def handle_message(update, context):
             msg += "\n💡 번호로 전송/이메일 첨부 가능!"
             await update.message.reply_text(msg)
         else:
-            await update.message.reply_text(f"😅 '{kw}' 결과 없음")
+            await update.message.reply_text(f"'{kw}' 결과 없음")
 
     elif "[DRIVE_LIST]" in resp:
         files = list_drive_files()
@@ -645,7 +777,7 @@ async def handle_message(update, context):
                 msg += f"{i}. 📄 {f['name']} ({f.get('modifiedTime','')[:10]})\n"
             await update.message.reply_text(msg)
         else:
-            await update.message.reply_text("📁 파일 없음")
+            await update.message.reply_text("파일 없음")
 
     elif "[DRIVE_SEND:" in resp:
         try:
@@ -658,7 +790,6 @@ async def handle_message(update, context):
                 if buf:
                     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
                     await update.message.reply_document(document=buf, filename=name, caption=f"📄 {name}")
-                    # 마지막 작업 저장
                     user_last_action[u.id] = {"type": "file", "file_id": fi["id"], "name": name}
                 else:
                     await update.message.reply_text("❌ 다운로드 실패")
@@ -680,11 +811,7 @@ async def handle_message(update, context):
                     ok, msg = send_gmail(to_addr, subject, body, buf, name)
                     if ok:
                         await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
-                        # 마지막 작업 저장
-                        user_last_action[u.id] = {
-                            "type": "email", "to": to_addr, "subject": subject,
-                            "body": body, "file_id": fi["id"], "file_name": name
-                        }
+                        user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject, "body": body, "file_id": fi["id"], "file_name": name}
                     else:
                         await update.message.reply_text(f"❌ 전송 실패: {msg}")
                 else:
@@ -703,11 +830,7 @@ async def handle_message(update, context):
             ok, msg = send_gmail(to_addr, subject, body)
             if ok:
                 await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
-                # 마지막 작업 저장
-                user_last_action[u.id] = {
-                    "type": "email", "to": to_addr,
-                    "subject": subject, "body": body
-                }
+                user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject, "body": body}
             else:
                 await update.message.reply_text(f"❌ 전송 실패: {msg}")
         except Exception as e:
@@ -765,9 +888,13 @@ async def handle_message(update, context):
             await update.message.reply_text(resp)
 
 def main():
+    init_db()
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("memo", cmd_memo))
+    app.add_handler(CommandHandler("memos", cmd_memos))
     app.add_handler(CommandHandler("files", cmd_files))
     app.add_handler(CommandHandler("mail", cmd_mail))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -782,7 +909,12 @@ def main():
         filters.Document.MimeType("video/mp4"),
         handle_audio_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Bot started! (Drive + Gmail + Speech + Web Search)")
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(check_new_gmail, "interval", minutes=30, args=[app])
+    scheduler.start()
+
+    logger.info("Bot started! (Drive + Gmail + Speech + Web Search + DB + Mail Alert)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
