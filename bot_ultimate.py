@@ -1,4 +1,4 @@
-import os, json, logging, io, base64, tempfile, asyncio
+import os, json, logging, io, base64, tempfile, asyncio, re
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -8,6 +8,7 @@ from collections import defaultdict
 
 import psycopg2
 from psycopg2.extras import Json
+import requests
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -34,12 +35,16 @@ GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+CLOVA_INVOKE_URL = os.environ.get("CLOVA_INVOKE_URL", "")
+CLOVA_SECRET_KEY = os.environ.get("CLOVA_SECRET_KEY", "")
+clova_available = bool(CLOVA_INVOKE_URL and CLOVA_SECRET_KEY)
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 MAX_HISTORY = 20
+VALID_STATE_FIELDS = {"search_results", "gmail_list", "last_action"}
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
 # PostgreSQL
@@ -89,13 +94,13 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_memo_user ON memos(user_id);
         """)
-        conn.close()
         logger.info("DB tables initialized!")
         return True
     except Exception as e:
         logger.error(f"DB init error: {e}")
-        conn.close()
         return False
+    finally:
+        conn.close()
 
 # 메모리 fallback
 _mem_history = defaultdict(list)
@@ -120,13 +125,13 @@ def db_get_history(user_id):
             (user_id, MAX_HISTORY)
         )
         rows = cur.fetchall()
-        conn.close()
         rows.reverse()
         return [{"role": r[0], "content": r[1]} for r in rows]
     except Exception as e:
         logger.error(f"db_get_history: {e}")
-        conn.close()
         return []
+    finally:
+        conn.close()
 
 def db_add_message(user_id, role, content):
     if not db_available:
@@ -143,9 +148,17 @@ def db_add_message(user_id, role, content):
             "INSERT INTO conversation_history (user_id, role, content) VALUES (%s, %s, %s)",
             (user_id, role, content)
         )
-        conn.close()
+        # DB 히스토리 MAX_HISTORY 초과분 정리
+        cur.execute("""
+            DELETE FROM conversation_history
+            WHERE user_id=%s AND id NOT IN (
+                SELECT id FROM conversation_history
+                WHERE user_id=%s ORDER BY id DESC LIMIT %s
+            )
+        """, (user_id, user_id, MAX_HISTORY))
     except Exception as e:
         logger.error(f"db_add_message: {e}")
+    finally:
         conn.close()
 
 def db_clear_history(user_id):
@@ -166,12 +179,14 @@ def db_clear_history(user_id):
             ON CONFLICT (user_id) DO UPDATE
             SET search_results='[]', gmail_list='[]', last_action='{}'
         """, (user_id,))
-        conn.close()
     except Exception as e:
         logger.error(f"db_clear_history: {e}")
+    finally:
         conn.close()
 
 def db_get_state(user_id, field):
+    if field not in VALID_STATE_FIELDS:
+        raise ValueError(f"Invalid state field: {field}")
     if not db_available:
         if field == "search_results":
             return list(_mem_search[user_id])
@@ -187,16 +202,18 @@ def db_get_state(user_id, field):
         cur = conn.cursor()
         cur.execute(f"SELECT {field} FROM user_state WHERE user_id=%s", (user_id,))
         row = cur.fetchone()
-        conn.close()
         if row:
             return row[0] if row[0] is not None else ([] if field != "last_action" else {})
         return [] if field != "last_action" else {}
     except Exception as e:
         logger.error(f"db_get_state {field}: {e}")
-        conn.close()
         return [] if field != "last_action" else {}
+    finally:
+        conn.close()
 
 def db_set_state(user_id, field, value):
+    if field not in VALID_STATE_FIELDS:
+        raise ValueError(f"Invalid state field: {field}")
     if not db_available:
         if field == "search_results":
             _mem_search[user_id] = value
@@ -214,9 +231,9 @@ def db_set_state(user_id, field, value):
             INSERT INTO user_state (user_id, {field}) VALUES (%s, %s)
             ON CONFLICT (user_id) DO UPDATE SET {field}=%s
         """, (user_id, Json(value), Json(value)))
-        conn.close()
     except Exception as e:
         logger.error(f"db_set_state {field}: {e}")
+    finally:
         conn.close()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
@@ -335,11 +352,15 @@ def download_drive_file(file_id):
 # ━━━━━━━━━━━━━━━━━━━━━━━
 # Gmail 함수
 # ━━━━━━━━━━━━━━━━━━━━━━━
+def _refresh_gmail_token():
+    if gmail_creds and gmail_creds.expired:
+        gmail_creds.refresh(Request())
+
 def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
     if not gmail_service or not gmail_creds:
         return False, "Gmail not connected"
     try:
-        gmail_creds.refresh(Request())
+        _refresh_gmail_token()
         msg = MIMEMultipart()
         msg["From"] = GMAIL_ADDRESS
         msg["To"] = to_addr
@@ -363,6 +384,7 @@ def get_gmail_list(max_results=10, query="is:unread"):
     if not gmail_service:
         return []
     try:
+        _refresh_gmail_token()
         result = gmail_service.users().messages().list(
             userId="me", maxResults=max_results, q=query
         ).execute()
@@ -390,6 +412,7 @@ def get_gmail_content(msg_id):
     if not gmail_service:
         return None
     try:
+        _refresh_gmail_token()
         msg = gmail_service.users().messages().get(
             userId="me", id=msg_id, format="full"
         ).execute()
@@ -416,18 +439,10 @@ def get_gmail_content(msg_id):
         return None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
-# 음성 인식
+# 음성 인식 (CLOVA Speech)
 # ━━━━━━━━━━━━━━━━━━━━━━━
 def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
-    import requests
-    import hmac
-    import hashlib
-    import time
-
-    CLOVA_INVOKE_URL = os.environ.get("CLOVA_INVOKE_URL", "")
-    CLOVA_SECRET_KEY = os.environ.get("CLOVA_SECRET_KEY", "")
-
-    if not CLOVA_INVOKE_URL or not CLOVA_SECRET_KEY:
+    if not clova_available:
         return None
 
     try:
@@ -435,7 +450,6 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
             "Accept": "application/json;UTF-8",
             "X-CLOVASPEECH-API-KEY": CLOVA_SECRET_KEY,
         }
-
         files = {
             "media": ("audio.m4a", audio_bytes, mime_type),
             "params": (None, json.dumps({
@@ -449,14 +463,12 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
                 }
             }), "application/json")
         }
-
         response = requests.post(
             CLOVA_INVOKE_URL + "/recognizer/upload",
             headers=headers,
             files=files,
             timeout=300
         )
-
         if response.status_code == 200:
             result = response.json()
             segments = result.get("segments", [])
@@ -473,48 +485,6 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
         return None
     except Exception as e:
         logger.error(f"CLOVA Speech error: {e}")
-        return None
-    try:
-        from pydub import AudioSegment
-        ext_map = {
-            "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
-            "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/m4a": ".m4a",
-            "audio/wav": ".wav", "audio/x-wav": ".wav", "video/mp4": ".mp4",
-        }
-        ext = ext_map.get(mime_type, ".mp3")
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
-            f.write(audio_bytes)
-            tmp_in = f.name
-        tmp_out = tmp_in + ".wav"
-        audio = AudioSegment.from_file(tmp_in)
-        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        audio.export(tmp_out, format="wav")
-        with open(tmp_out, "rb") as f:
-            wav_bytes = f.read()
-        os.unlink(tmp_in)
-        os.unlink(tmp_out)
-        body = {
-            "config": {
-                "encoding": "LINEAR16",
-                "sampleRateHertz": 16000,
-                "languageCode": "ko-KR",
-                "alternativeLanguageCodes": ["en-US"],
-                "enableAutomaticPunctuation": True,
-                "model": "latest_long",
-                "useEnhanced": True,
-            },
-            "audio": {"content": base64.b64encode(wav_bytes).decode("utf-8")},
-        }
-        resp = speech_service.speech().recognize(body=body).execute()
-        results = resp.get("results", [])
-        if results:
-            return " ".join(
-                r["alternatives"][0]["transcript"]
-                for r in results if r.get("alternatives")
-            )
-        return "음성 인식 결과 없음"
-    except Exception as e:
-        logger.error(f"Speech error: {e}")
         return None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━
@@ -635,7 +605,7 @@ async def cmd_start(update, context):
         return
     d = "✅" if drive_service else "❌"
     g = "✅" if gmail_service else "❌"
-    s = "✅" if speech_service else "❌"
+    s = "✅" if clova_available else "❌"
     db = "✅" if db_available else "메모리"
     await update.message.reply_text(
         f"보스, 안녕하세요! 👋\n\n"
@@ -712,7 +682,6 @@ async def cmd_memo(update, context):
             (uid,)
         )
         rows = cur.fetchall()
-        conn.close()
         if not rows:
             await update.message.reply_text("저장된 메모 없음")
             return
@@ -724,6 +693,8 @@ async def cmd_memo(update, context):
     except Exception as e:
         logger.error(f"cmd_memo error: {e}")
         await update.message.reply_text("메모 조회 실패")
+    finally:
+        conn.close()
 
 async def cmd_help(update, context):
     if not is_authorized(update.effective_user.id):
@@ -746,7 +717,7 @@ async def handle_voice(update, context):
     u = update.effective_user
     if not is_authorized(u.id):
         return
-    if not speech_service:
+    if not clova_available:
         await update.message.reply_text("음성 분석 미연결")
         return
     await update.message.reply_text("🎙️ 음성 분석 중...")
@@ -770,7 +741,7 @@ async def handle_audio_file(update, context):
     u = update.effective_user
     if not is_authorized(u.id):
         return
-    if not speech_service:
+    if not clova_available:
         await update.message.reply_text("음성 분석 미연결")
         return
     await update.message.reply_text("🎙️ 오디오 분석 중...")
@@ -854,23 +825,26 @@ async def handle_message(update, context):
             await update.message.reply_text("파일 없음")
 
     elif "[DRIVE_SEND:" in resp:
-        try:
-            num = int(resp.split("[DRIVE_SEND:")[1].split("]")[0]) - 1
-            files = db_get_state(u.id, "search_results")
-            if 0 <= num < len(files):
-                fi = files[num]
-                await update.message.reply_text(f"'{fi['name']}' 전송 중...")
-                buf, name = download_drive_file(fi["id"])
-                if buf:
-                    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
-                    await update.message.reply_document(document=buf, filename=name, caption=name)
-                    db_set_state(u.id, "last_action", {"type": "file", "file_id": fi["id"], "name": name})
+        # 여러 [DRIVE_SEND:N] 명령을 모두 처리
+        nums = re.findall(r'\[DRIVE_SEND:(\d+)\]', resp)
+        files = db_get_state(u.id, "search_results")
+        for num_str in nums:
+            try:
+                num = int(num_str) - 1
+                if 0 <= num < len(files):
+                    fi = files[num]
+                    await update.message.reply_text(f"'{fi['name']}' 전송 중...")
+                    buf, name = download_drive_file(fi["id"])
+                    if buf:
+                        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
+                        await update.message.reply_document(document=buf, filename=name, caption=name)
+                        db_set_state(u.id, "last_action", {"type": "file", "file_id": fi["id"], "name": name})
+                    else:
+                        await update.message.reply_text(f"'{fi['name']}' 다운로드 실패")
                 else:
-                    await update.message.reply_text("다운로드 실패")
-            else:
-                await update.message.reply_text("잘못된 번호")
-        except Exception:
-            await update.message.reply_text("번호 확인 필요")
+                    await update.message.reply_text(f"{num_str}번: 잘못된 번호")
+            except Exception:
+                await update.message.reply_text("번호 확인 필요")
 
     elif "[EMAIL_WITH_FILE:" in resp:
         try:
@@ -965,11 +939,12 @@ async def handle_message(update, context):
                 try:
                     cur = conn.cursor()
                     cur.execute("INSERT INTO memos (user_id, content) VALUES (%s, %s)", (u.id, content))
-                    conn.close()
                     await update.message.reply_text(f"📝 메모 저장 완료!\n\n{content}")
                 except Exception as e:
                     logger.error(f"Memo save error: {e}")
                     await update.message.reply_text("메모 저장 실패")
+                finally:
+                    conn.close()
         else:
             await update.message.reply_text("DB 미연결")
 
@@ -988,11 +963,12 @@ async def handle_message(update, context):
 # 메인
 # ━━━━━━━━━━━━━━━━━━━━━━━
 async def check_new_emails(app):
-    """30분마다 새 메일 체크해서 텔레그램 알림"""
+    """1시간마다 새 메일 체크해서 텔레그램 알림"""
     if not gmail_service or not ALLOWED_USER_IDS:
         return
     try:
-        emails = get_gmail_list(5, "is:unread newer_than:61m")
+        # 65분 이내 메일 조회 — 1시간 주기 실행 시 누락 방지를 위해 여유 5분 확보
+        emails = get_gmail_list(5, "is:unread newer_than:65m")
         if not emails:
             return
         uid = next(iter(ALLOWED_USER_IDS))
