@@ -62,6 +62,10 @@ def init_db():
         return False
     try:
         cur = conn.cursor()
+        # 기존 테이블 스키마 문제 자동 수정
+        cur.execute("""
+            DROP TABLE IF EXISTS conversation_history;
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS conversation_history (
                 id SERIAL PRIMARY KEY,
