@@ -1,8 +1,4 @@
-import os, json, logging, io, base64, smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email import encoders
+import os, json, logging, io, base64, urllib.request, urllib.parse
 from datetime import datetime
 from collections import defaultdict
 from telegram import Update
@@ -21,7 +17,7 @@ ALLOWED_USER_IDS = (
 )
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS", "")
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -107,26 +103,44 @@ def download_drive_file(file_id):
         return None, None
 
 def send_email(to_addr, subject, body, attach_buf=None, attach_name=None):
-    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
-        return False, "Email not configured"
+    if not RESEND_API_KEY:
+        return False, "Resend API key not set"
     try:
-        msg = MIMEMultipart()
-        msg["From"] = GMAIL_ADDRESS
-        msg["To"] = to_addr
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
+        from_addr = f"비서봇 <onboarding@resend.dev>"
+        if GMAIL_ADDRESS:
+            reply_to = GMAIL_ADDRESS
+        else:
+            reply_to = None
+
+        email_data = {
+            "from": from_addr,
+            "to": [to_addr],
+            "subject": subject,
+            "text": body,
+        }
+        if reply_to:
+            email_data["reply_to"] = reply_to
+
         if attach_buf and attach_name:
             attach_buf.seek(0)
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(attach_buf.read())
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={attach_name}")
-            msg.attach(part)
-      with smtplib.SMTP("smtp.gmail.com", 587) as s:
-            s.starttls()
-            s.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-            s.sendmail(GMAIL_ADDRESS, to_addr, msg.as_string())
-        return True, "OK"
+            file_b64 = base64.b64encode(attach_buf.read()).decode("utf-8")
+            email_data["attachments"] = [{"filename": attach_name, "content": file_b64}]
+
+        data = json.dumps(email_data).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=data,
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if result.get("id"):
+                return True, "OK"
+            return False, str(result)
     except Exception as e:
         logger.error(f"Email error: {e}")
         return False, str(e)
@@ -199,26 +213,25 @@ async def ask_claude(user_id, message):
             tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
             messages=history,
         )
-        # Extract text from response blocks
         text_parts = []
         for block in r.content:
             if block.type == "text":
                 text_parts.append(block.text)
-        txt = "\n".join(text_parts) if text_parts else "응답을 생성하지 못했습니다."
+        txt = "\n".join(text_parts) if text_parts else "No response."
         history.append({"role": "assistant", "content": r.content})
         return txt
     except anthropic.APIError as e:
         logger.error(f"Claude error: {e}")
         history.pop()
-        return "⚠️ AI 오류. 잠시 후 다시 시도하세요."
+        return "⚠️ AI error. Please try again."
 
 async def cmd_start(update, context):
     u = update.effective_user
     if not is_authorized(u.id):
-        await update.message.reply_text("⛔ 권한 없음")
+        await update.message.reply_text("Access denied.")
         return
     d = "✅" if drive_service else "❌"
-    e = "✅" if GMAIL_ADDRESS else "❌"
+    e = "✅" if RESEND_API_KEY else "❌"
     s = "✅" if speech_service else "❌"
     await update.message.reply_text(
         f"안녕하세요, {u.first_name}님! 👋\n\n"
@@ -236,12 +249,12 @@ async def cmd_files(update, context):
     uid = update.effective_user.id
     if not is_authorized(uid): return
     if not drive_service:
-        await update.message.reply_text("❌ Drive 미연결")
+        await update.message.reply_text("❌ Drive not connected")
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     files = list_drive_files()
     if not files:
-        await update.message.reply_text("📁 파일 없음")
+        await update.message.reply_text("📁 No files")
         return
     user_search_results[uid] = files
     msg = "📁 파일 목록:\n\n"
@@ -255,17 +268,17 @@ async def cmd_help(update, context):
     await update.message.reply_text(
         "📖 사용 가이드\n\n"
         "💬 대화: 메시지 보내면 AI 답변\n\n"
-        "🔍 검색: '오늘 뉴스', '코스피 지수' 등 물어보면 실시간 검색\n\n"
-        "📁 파일: '파일 찾아줘', '1번 보내줘', /files\n\n"
-        "📧 이메일: '1번 파일 abc@gmail.com으로 보내줘'\n\n"
-        "🎙️ 음성: 음성메시지 또는 녹음파일 보내면 자동 분석\n\n"
+        "🔍 검색: '오늘 뉴스', '코스피' 등 실시간 검색\n\n"
+        "📁 파일: '파일 찾아줘', '보내줘', /files\n\n"
+        "📧 이메일: '이거 abc@gmail.com으로 보내줘'\n\n"
+        "🎙️ 음성: 음성메시지/녹음파일 보내면 자동 분석\n\n"
         "/clear - 초기화")
 
 async def handle_voice(update, context):
     u = update.effective_user
     if not is_authorized(u.id): return
     if not speech_service:
-        await update.message.reply_text("❌ 음성 분석 미연결")
+        await update.message.reply_text("❌ Speech not connected")
         return
     await update.message.reply_text("🎙️ 음성 분석 중...")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -289,9 +302,9 @@ async def handle_audio_file(update, context):
     u = update.effective_user
     if not is_authorized(u.id): return
     if not speech_service:
-        await update.message.reply_text("❌ 음성 분석 미연결")
+        await update.message.reply_text("❌ Speech not connected")
         return
-    await update.message.reply_text("🎙️ 오디오 분석 중... (시간이 걸릴 수 있습니다)")
+    await update.message.reply_text("🎙️ 오디오 분석 중...")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     audio = update.message.audio or update.message.document
     f = await context.bot.get_file(audio.file_id)
@@ -301,11 +314,11 @@ async def handle_audio_file(update, context):
     if txt:
         if len(txt) > 3000:
             for i in range(0, len(txt), 3000):
-                await update.message.reply_text(f"📝 텍스트 ({i//3000+1}):\n\n{txt[i:i+3000]}")
+                await update.message.reply_text(f"📝 ({i//3000+1}):\n\n{txt[i:i+3000]}")
         else:
             await update.message.reply_text(f"📝 텍스트:\n\n{txt}")
         analysis = await ask_claude(u.id,
-            f"통화/음성 녹음 텍스트입니다. 핵심 내용 요약하고 중요 포인트 정리해줘:\n\n{txt}")
+            f"통화/음성 녹음입니다. 핵심 요약하고 중요 포인트 정리해줘:\n\n{txt}")
         if len(analysis) > 4096:
             for i in range(0, len(analysis), 4096):
                 await update.message.reply_text(analysis[i:i+4096])
@@ -317,7 +330,7 @@ async def handle_audio_file(update, context):
 async def handle_message(update, context):
     u = update.effective_user
     if not is_authorized(u.id):
-        await update.message.reply_text("⛔ 권한 없음")
+        await update.message.reply_text("Access denied.")
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     resp = await ask_claude(u.id, update.message.text)
@@ -371,7 +384,7 @@ async def handle_message(update, context):
             files = user_search_results.get(u.id, [])
             if 0 <= fnum < len(files):
                 fi = files[fnum]
-                await update.message.reply_text(f"📧 '{fi['name']}' 첨부하여 이메일 전송 중...")
+                await update.message.reply_text(f"📧 '{fi['name']}' 첨부하여 전송 중...")
                 buf, name = download_drive_file(fi["id"])
                 if buf:
                     ok, msg = send_email(to_addr, subject, body, buf, name)
