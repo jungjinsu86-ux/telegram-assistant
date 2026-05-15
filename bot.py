@@ -215,14 +215,28 @@ def get_gmail_content(msg_id):
         logger.error(f"Gmail read error: {e}")
         return None
 
-# ── Speech (m4a 포함 자동 변환)
+# ── Speech (버그 수정: 확장자 + 한국어 모델)
 def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
     if not speech_service:
         return None
     try:
         from pydub import AudioSegment
 
-        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as f:
+        # mime_type에 맞는 확장자 사용
+        ext_map = {
+            "audio/ogg": ".ogg",
+            "audio/mpeg": ".mp3",
+            "audio/mp3": ".mp3",
+            "audio/mp4": ".m4a",
+            "audio/x-m4a": ".m4a",
+            "audio/m4a": ".m4a",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "video/mp4": ".mp4",
+        }
+        ext = ext_map.get(mime_type, ".mp3")
+
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
             f.write(audio_bytes)
             tmp_in = f.name
         tmp_out = tmp_in + ".wav"
@@ -245,8 +259,8 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
                 "languageCode": "ko-KR",
                 "alternativeLanguageCodes": ["en-US"],
                 "enableAutomaticPunctuation": True,
-                "model": "phone_call",  # 통화 녹음 전용 모델
-                "useEnhanced": True,    # 향상된 인식 사용
+                "model": "latest_long",  # 한국어 지원 모델 (phone_call은 영어 전용)
+                "useEnhanced": True,
             },
             "audio": {"content": base64.b64encode(wav_bytes).decode("utf-8")},
         }
@@ -308,8 +322,8 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 - "작년에 만든 강의안" → [DRIVE_SEARCH:강의안]
 
 전송 트리거:
-"줘", "보내줘", "전송해", "받고싶어", "다운로드", "보내라고", 
-"그거줘", "이거줘", "아까그거", "방금그거" 
+"줘", "보내줘", "전송해", "받고싶어", "다운로드", "보내라고",
+"그거줘", "이거줘", "아까그거", "방금그거"
 → 직전 검색결과 1번을 [DRIVE_SEND:1]
 
 번호 지정:
@@ -422,7 +436,7 @@ async def cmd_start(update, context):
     g = "✅" if gmail_service else "❌"
     s = "✅" if speech_service else "❌"
     await update.message.reply_text(
-        f"안녕하세요, {u.first_name}님! 👋\n\n"
+        f"보스, 안녕하세요! 👋\n\n"
         f"📁 Drive: {d}  📧 Gmail: {g}  🎙️ 음성: {s}  🔍 웹검색: ✅\n\n"
         f"/files - 파일 목록\n"
         f"/mail - 받은 메일 목록\n"
@@ -482,7 +496,7 @@ async def cmd_help(update, context):
         "💬 대화: 메시지 보내면 AI 답변\n\n"
         "🔍 검색: '오늘 뉴스', '코스피' 등 실시간 검색\n\n"
         "📁 파일:\n- '파일 찾아줘 [이름]'\n- '보내줘'\n- /files\n\n"
-        "📧 이메일:\n- 'korbomb@naver.com에 안녕 보내줘'\n- '1번 파일 메일로 보내줘'\n\n"
+        "📧 이메일:\n- 'abc@gmail.com에 안녕 보내줘'\n- '1번 파일 메일로 보내줘'\n\n"
         "📬 메일 읽기:\n- /mail 또는 '받은 메일 보여줘'\n- '1번 메일 읽어줘'\n\n"
         "🎙️ 음성: 음성메시지/m4a/mp3 보내면 자동 분석\n\n"
         "/clear - 초기화")
