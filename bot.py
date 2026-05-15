@@ -595,7 +595,7 @@ def _select_image_prompt(text):
 
 async def _call_vision(b64, mime_type, system_prompt, prompt, update):
     r = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=4096,
         system=system_prompt,
         messages=[{"role": "user", "content": [
@@ -801,7 +801,9 @@ async def handle_voice(update, context):
     if txt:
         await update.message.reply_text(f"📝 텍스트:\n\n{txt}")
         analysis = await ask_claude(u.id, f"다음 음성 내용을 분석하고 요약해줘:\n\n{txt}")
-        await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
+        full = f"🔍 분석:\n\n{analysis}"
+        for i in range(0, len(full), 4096):
+            await update.message.reply_text(full[i:i+4096])
     else:
         await update.message.reply_text("❌ 음성 인식 실패")
 
@@ -829,7 +831,9 @@ async def handle_audio_file(update, context):
             await update.message.reply_text(f"📝 텍스트:\n\n{txt}")
         analysis = await ask_claude(u.id,
             f"통화/음성 녹음입니다. 핵심 요약하고 중요 포인트 정리해줘:\n\n{txt}")
-        await update.message.reply_text(f"🔍 분석:\n\n{analysis}")
+        full = f"🔍 분석:\n\n{analysis}"
+        for i in range(0, len(full), 4096):
+            await update.message.reply_text(full[i:i+4096])
     else:
         await update.message.reply_text("❌ 음성 인식 실패")
 
