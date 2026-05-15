@@ -54,6 +54,7 @@ if GOOGLE_CREDENTIALS_JSON:
 
 # ── Gmail API
 gmail_service = None
+gmail_creds = None
 if GMAIL_REFRESH_TOKEN and GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET:
     try:
         gmail_creds = Credentials(
@@ -134,28 +135,32 @@ def download_drive_file(file_id):
         logger.error(f"Drive download error: {e}")
         return None, None
 
-# ── Gmail send
+# ── Gmail send (토큰 자동갱신 + 한글 인코딩 수정)
 def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
-    if not gmail_service:
+    if not gmail_service or not gmail_creds:
         return False, "Gmail not connected"
     try:
+        # 토큰 자동 갱신
         gmail_creds.refresh(Request())
+
         msg = MIMEMultipart()
         msg["From"] = GMAIL_ADDRESS
         msg["To"] = to_addr
         msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        msg.attach(MIMEText(body, "plain", "utf-8"))  # 한글 본문 인코딩
+
         if attach_buf and attach_name:
             attach_buf.seek(0)
             part = MIMEBase("application", "octet-stream")
             part.set_payload(attach_buf.read())
             encoders.encode_base64(part)
             part.add_header(
-  "Content-Disposition",
-    "attachment",
-    filename=("utf-8", "", attach_name)
-)
+                "Content-Disposition",
+                "attachment",
+                filename=("utf-8", "", attach_name)  # 한글 파일명 인코딩
+            )
             msg.attach(part)
+
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
         gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
         return True, "OK"
@@ -220,14 +225,13 @@ def get_gmail_content(msg_id):
         logger.error(f"Gmail read error: {e}")
         return None
 
-# ── Speech (버그 수정: 확장자 + 한국어 모델)
+# ── Speech (확장자 + 한국어 모델)
 def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
     if not speech_service:
         return None
     try:
         from pydub import AudioSegment
 
-        # mime_type에 맞는 확장자 사용
         ext_map = {
             "audio/ogg": ".ogg",
             "audio/mpeg": ".mp3",
@@ -246,7 +250,6 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
             tmp_in = f.name
         tmp_out = tmp_in + ".wav"
 
-        # 모든 형식을 WAV(16kHz, 모노)로 변환 - 인식률 극대화
         audio = AudioSegment.from_file(tmp_in)
         audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         audio.export(tmp_out, format="wav")
@@ -264,7 +267,7 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
                 "languageCode": "ko-KR",
                 "alternativeLanguageCodes": ["en-US"],
                 "enableAutomaticPunctuation": True,
-                "model": "latest_long",  # 한국어 지원 모델 (phone_call은 영어 전용)
+                "model": "latest_long",
                 "useEnhanced": True,
             },
             "audio": {"content": base64.b64encode(wav_bytes).decode("utf-8")},
@@ -315,6 +318,7 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 [EMAIL_WITH_FILE:주소|제목|본문|파일번호]
 [GMAIL_LIST:검색쿼리]
 [GMAIL_READ:번호]
+[REPEAT_LAST]
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 📁 파일 처리 규칙
@@ -334,6 +338,12 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 번호 지정:
 "2번", "두번째", "뒤에꺼", "마지막꺼" → 해당 번호로 처리
 결과가 1개뿐이면 → 바로 [DRIVE_SEND:1] (확인 없이)
+
+━━━━━━━━━━━━━━━━━━━━━━━
+🔄 반복 작업 규칙
+━━━━━━━━━━━━━━━━━━━━━━━
+"다시", "또", "한번 더", "재전송", "다시 보내줘", "또 보내줘"
+→ [REPEAT_LAST] (직전 작업 그대로 반복)
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 📧 이메일 전송 규칙
@@ -410,6 +420,7 @@ def is_authorized(uid):
 
 user_search_results = defaultdict(list)
 user_gmail_list = defaultdict(list)
+user_last_action = defaultdict(dict)  # 마지막 작업 기억
 
 async def ask_claude(user_id, message):
     history = conversation_history[user_id]
@@ -454,6 +465,7 @@ async def cmd_clear(update, context):
     conversation_history[uid].clear()
     user_search_results[uid].clear()
     user_gmail_list[uid].clear()
+    user_last_action[uid].clear()
     await update.message.reply_text("🗑️ 초기화 완료!")
 
 async def cmd_files(update, context):
@@ -504,6 +516,7 @@ async def cmd_help(update, context):
         "📧 이메일:\n- 'abc@gmail.com에 안녕 보내줘'\n- '1번 파일 메일로 보내줘'\n\n"
         "📬 메일 읽기:\n- /mail 또는 '받은 메일 보여줘'\n- '1번 메일 읽어줘'\n\n"
         "🎙️ 음성: 음성메시지/m4a/mp3 보내면 자동 분석\n\n"
+        "🔄 다시 보내기: '다시', '또 보내줘'\n\n"
         "/clear - 초기화")
 
 async def handle_voice(update, context):
@@ -556,6 +569,36 @@ async def handle_audio_file(update, context):
     else:
         await update.message.reply_text("❌ 음성 인식 실패")
 
+async def do_send_file(update, context, file_id, file_name):
+    """파일 전송 공통 함수"""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
+    buf, name = download_drive_file(file_id)
+    if buf:
+        await update.message.reply_document(document=buf, filename=name, caption=f"📄 {name}")
+        return True
+    else:
+        await update.message.reply_text("❌ 다운로드 실패")
+        return False
+
+async def do_send_email(update, to_addr, subject, body, file_id=None, file_name=None):
+    """이메일 전송 공통 함수"""
+    if file_id:
+        buf, name = download_drive_file(file_id)
+        if buf:
+            ok, msg = send_gmail(to_addr, subject, body, buf, name)
+        else:
+            await update.message.reply_text("❌ 파일 다운로드 실패")
+            return False
+    else:
+        ok, msg = send_gmail(to_addr, subject, body)
+
+    if ok:
+        await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
+        return True
+    else:
+        await update.message.reply_text(f"❌ 전송 실패: {msg}")
+        return False
+
 async def handle_message(update, context):
     u = update.effective_user
     if not is_authorized(u.id):
@@ -564,6 +607,22 @@ async def handle_message(update, context):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     resp = await ask_claude(u.id, update.message.text)
 
+    # ── 직전 작업 반복
+    if "[REPEAT_LAST]" in resp:
+        last = user_last_action.get(u.id, {})
+        if not last:
+            await update.message.reply_text("❌ 반복할 이전 작업이 없습니다.")
+            return
+        if last["type"] == "file":
+            await update.message.reply_text(f"📤 '{last['name']}' 다시 전송 중...")
+            await do_send_file(update, context, last["file_id"], last["name"])
+        elif last["type"] == "email":
+            await update.message.reply_text(f"📧 {last['to']}로 다시 전송 중...")
+            await do_send_email(update, last["to"], last["subject"], last["body"],
+                                last.get("file_id"), last.get("file_name"))
+        return
+
+    # ── Drive 검색
     if "[DRIVE_SEARCH:" in resp:
         kw = resp.split("[DRIVE_SEARCH:")[1].split("]")[0]
         files = search_drive_files(kw)
@@ -595,10 +654,12 @@ async def handle_message(update, context):
             if 0 <= num < len(files):
                 fi = files[num]
                 await update.message.reply_text(f"📤 '{fi['name']}' 전송 중...")
-                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
                 buf, name = download_drive_file(fi["id"])
                 if buf:
+                    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
                     await update.message.reply_document(document=buf, filename=name, caption=f"📄 {name}")
+                    # 마지막 작업 저장
+                    user_last_action[u.id] = {"type": "file", "file_id": fi["id"], "name": name}
                 else:
                     await update.message.reply_text("❌ 다운로드 실패")
             else:
@@ -619,6 +680,11 @@ async def handle_message(update, context):
                     ok, msg = send_gmail(to_addr, subject, body, buf, name)
                     if ok:
                         await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
+                        # 마지막 작업 저장
+                        user_last_action[u.id] = {
+                            "type": "email", "to": to_addr, "subject": subject,
+                            "body": body, "file_id": fi["id"], "file_name": name
+                        }
                     else:
                         await update.message.reply_text(f"❌ 전송 실패: {msg}")
                 else:
@@ -637,6 +703,11 @@ async def handle_message(update, context):
             ok, msg = send_gmail(to_addr, subject, body)
             if ok:
                 await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
+                # 마지막 작업 저장
+                user_last_action[u.id] = {
+                    "type": "email", "to": to_addr,
+                    "subject": subject, "body": body
+                }
             else:
                 await update.message.reply_text(f"❌ 전송 실패: {msg}")
         except Exception as e:
