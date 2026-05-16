@@ -648,7 +648,6 @@ MARKETING_SYSTEM_PROMPT = """당신은 SNS 마케팅 13년 경력의 마케터�
 ⚠️ 개선 포인트
 📈 마케팅 성과를 높이는 제안"""
 
-INSTAGRAM_KEYWORDS = {"인스타", "캡션", "게시물", "피드"}
 ANALYSIS_KEYWORDS = {"분석", "피드백", "인스타", "캡션", "마케팅", "마케터", "평가", "리뷰", "봐줘", "어때"}
 
 def _select_image_prompt(text):
@@ -950,7 +949,7 @@ async def handle_voice(update, context):
         logger.error(f"Voice download error: {e}")
         await update.message.reply_text("❌ 파일 다운로드 실패")
         return
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     txt = await loop.run_in_executor(None, transcribe_audio, bytes(data), voice.mime_type or "audio/ogg")
     if txt:
         transcript = f"📝 텍스트:\n\n{txt}"
