@@ -885,7 +885,7 @@ async def cmd_newsdel(update, context):
     if not is_authorized(uid): return
     keyword = " ".join(context.args).strip()
     if not keyword:
-        await update.message.reply_text("사용법: /뉴스삭제 키워드명")
+        await update.message.reply_text("사용법: /newsdel 키워드명")
         return
     deleted = delete_news_keyword(uid, keyword)
     if deleted:
@@ -977,7 +977,7 @@ async def handle_audio_file(update, context):
         logger.error(f"Audio download error: {e}")
         await update.message.reply_text("❌ 파일 다운로드 실패")
         return
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     txt = await loop.run_in_executor(None, transcribe_audio, bytes(data), audio.mime_type or "audio/mpeg")
     if txt:
         if len(txt) > 3000:
