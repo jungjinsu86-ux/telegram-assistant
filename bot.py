@@ -466,14 +466,16 @@ def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
         return False, str(e)
 
 # ── Gmail read
-def get_gmail_list(max_results=10, query="is:unread"):
+def get_gmail_list(max_results=10, query="is:unread", page_token=None):
     if not gmail_service:
-        return []
+        return [], None
     try:
-        result = gmail_service.users().messages().list(
-            userId="me", maxResults=max_results, q=query
-        ).execute()
+        params = {"userId": "me", "maxResults": max_results, "q": query}
+        if page_token:
+            params["pageToken"] = page_token
+        result = gmail_service.users().messages().list(**params).execute()
         messages = result.get("messages", [])
+        next_token = result.get("nextPageToken")
         emails = []
         for m in messages[:max_results]:
             msg = gmail_service.users().messages().get(
@@ -489,10 +491,10 @@ def get_gmail_list(max_results=10, query="is:unread"):
                 "snippet": msg.get("snippet", ""),
                 "internal_date": msg.get("internalDate", "0"),
             })
-        return emails
+        return emails, next_token
     except Exception as e:
         logger.error(f"Gmail list error: {e}")
-        return []
+        return [], None
 
 def _strip_html(html):
     text = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL | re.IGNORECASE)
@@ -537,6 +539,38 @@ def _format_kst_time(internal_date_ms):
         return f"{dt.year}.{dt.month:02d}.{dt.day:02d} {ampm} {h12}:{dt.minute:02d}"
     except Exception:
         return ""
+
+def _fetch_until(uid, need, query):
+    """user_gmail_list[uid]가 need개 미만이면 nextPageToken으로 추가 fetch."""
+    emails = list(user_gmail_list.get(uid, []))
+    while len(emails) < need and user_mail_token.get(uid) is not None:
+        new_emails, next_token = get_gmail_list(10, query, user_mail_token[uid])
+        emails.extend(new_emails)
+        user_mail_token[uid] = next_token
+        if not new_emails:
+            break
+    user_gmail_list[uid] = emails
+    return emails
+
+def _build_mail_msg(emails, start, end, has_more):
+    """emails[start:end] 슬라이스를 텔레그램 메시지 문자열로 변환."""
+    page = emails[start:end]
+    if not page:
+        return None
+    msg = f"📬 메일 목록 ({start+1}~{start+len(page)}번):\n\n"
+    for i, e in enumerate(page, start + 1):
+        sender = e["from"].split("<")[0].strip()[:20]
+        subject = e["subject"][:30]
+        time_str = _format_kst_time(e.get("internal_date", "0"))
+        msg += f"{i}. 📧 {sender}\n   📌 {subject}\n"
+        if time_str:
+            msg += f"   🕐 {time_str}\n"
+        msg += "\n"
+    if has_more:
+        msg += "💡 '다음 메일' 더 보기 | '[번호]번 메일 읽어줘'"
+    else:
+        msg += "💡 '[번호]번 메일 읽어줘'"
+    return msg
 
 def get_gmail_content(msg_id):
     if not gmail_service:
@@ -687,6 +721,8 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 [EMAIL_WITH_FILE:주소|제목|본문|파일번호]
 [GMAIL_LIST:검색쿼리]
 [GMAIL_READ:번호]
+[GMAIL_MORE]
+[GMAIL_UNTIL:번호]
 [REPEAT_LAST]
 [MEMO_DELETE:번호]
 [MEMO_DELETE_ALL]
@@ -726,6 +762,8 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 "오늘 온 메일" → [GMAIL_LIST:newer_than:1d]
 "○○한테서 온 메일" → [GMAIL_LIST:from:○○]
 "1번 메일 읽어줘" → [GMAIL_READ:1]
+"다음 메일", "더 보여줘", "11번부터" → [GMAIL_MORE]
+"15번까지 보여줘", "N번까지" → [GMAIL_UNTIL:N]
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 🗑️ 메모 삭제 규칙
@@ -964,6 +1002,9 @@ user_search_results = defaultdict(list)
 user_gmail_list = defaultdict(list)
 user_last_action = defaultdict(dict)
 user_last_photo = {}
+user_mail_offset = {}    # uid -> 다음 표시 시작 인덱스 (0-based)
+user_mail_token = {}     # uid -> nextPageToken (None이면 마지막 페이지)
+user_mail_query_store = {}  # uid -> 현재 페이지네이션 중인 Gmail 쿼리
 
 async def ask_gpt(message):
     if not openai_client:
@@ -1054,7 +1095,7 @@ async def check_new_gmail(app):
     if not gmail_service or not ALLOWED_USER_IDS or not DATABASE_URL:
         return
     try:
-        emails = get_gmail_list(10, "is:unread newer_than:2h")
+        emails, _ = get_gmail_list(10, "is:unread newer_than:2h")
         if not emails:
             return
         current_ids = [e["id"] for e in emails]
@@ -1113,6 +1154,9 @@ async def cmd_clear(update, context):
     user_gmail_list[uid].clear()
     user_last_action[uid].clear()
     user_last_photo.pop(uid, None)
+    user_mail_offset.pop(uid, None)
+    user_mail_token.pop(uid, None)
+    user_mail_query_store.pop(uid, None)
     await update.message.reply_text("🗑️ 초기화 완료!")
 
 async def cmd_memo(update, context):
@@ -1218,21 +1262,17 @@ async def cmd_mail(update, context):
         await update.message.reply_text("❌ Gmail 미연결")
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    emails = get_gmail_list(10, "is:unread")
+    query = "is:unread"
+    emails, next_token = get_gmail_list(10, query)
     if not emails:
         await update.message.reply_text("📭 읽지 않은 메일 없음")
         return
     user_gmail_list[uid] = emails
-    msg = "📬 읽지 않은 메일:\n\n"
-    for i, e in enumerate(emails, 1):
-        sender = e["from"].split("<")[0].strip()[:20]
-        subject = e["subject"][:30]
-        time_str = _format_kst_time(e.get("internal_date", "0"))
-        msg += f"{i}. 📧 {sender}\n   📌 {subject}\n"
-        if time_str:
-            msg += f"   🕐 {time_str}\n"
-        msg += "\n"
-    msg += "💡 '1번 메일 읽어줘'라고 하세요!"
+    user_mail_token[uid] = next_token
+    user_mail_query_store[uid] = query
+    user_mail_offset[uid] = len(emails)
+    has_more = next_token is not None
+    msg = _build_mail_msg(emails, 0, 10, has_more)
     for i in range(0, len(msg), 4096):
         await update.message.reply_text(msg[i:i+4096])
 
@@ -1592,19 +1632,14 @@ async def handle_message(update, context):
     elif "[GMAIL_LIST:" in resp:
         query = resp.split("[GMAIL_LIST:")[1].split("]")[0]
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-        emails = get_gmail_list(10, query)
+        emails, next_token = get_gmail_list(10, query)
         if emails:
             user_gmail_list[u.id] = emails
-            msg = "📬 메일 목록:\n\n"
-            for i, e in enumerate(emails, 1):
-                sender = e["from"].split("<")[0].strip()[:20]
-                subject = e["subject"][:30]
-                time_str = _format_kst_time(e.get("internal_date", "0"))
-                msg += f"{i}. 📧 {sender}\n   📌 {subject}\n"
-                if time_str:
-                    msg += f"   🕐 {time_str}\n"
-                msg += "\n"
-            msg += "💡 '1번 메일 읽어줘'라고 하세요!"
+            user_mail_token[u.id] = next_token
+            user_mail_query_store[u.id] = query
+            user_mail_offset[u.id] = len(emails)
+            has_more = next_token is not None
+            msg = _build_mail_msg(emails, 0, 10, has_more)
             for i in range(0, len(msg), 4096):
                 await update.message.reply_text(msg[i:i+4096])
         else:
@@ -1640,6 +1675,42 @@ async def handle_message(update, context):
         except Exception as e:
             logger.error(f"Gmail read error: {e}")
             await update.message.reply_text("❌ 번호 확인 필요")
+
+    elif "[GMAIL_MORE]" in resp:
+        uid = u.id
+        query = user_mail_query_store.get(uid, "is:unread")
+        start = user_mail_offset.get(uid, 0)
+        end = start + 10
+        emails = _fetch_until(uid, end, query)
+        page = emails[start:end]
+        if not page:
+            await update.message.reply_text("📭 더 이상 메일이 없어요.")
+        else:
+            user_mail_offset[uid] = start + len(page)
+            has_more = bool(user_mail_token.get(uid)) or len(emails) > end
+            msg = _build_mail_msg(emails, start, end, has_more)
+            for i in range(0, len(msg), 4096):
+                await update.message.reply_text(msg[i:i+4096])
+
+    elif "[GMAIL_UNTIL:" in resp:
+        try:
+            n = int(resp.split("[GMAIL_UNTIL:")[1].split("]")[0])
+            uid = u.id
+            query = user_mail_query_store.get(uid, "is:unread")
+            start = user_mail_offset.get(uid, 0)
+            emails = _fetch_until(uid, n, query)
+            page = emails[start:n]
+            if not page:
+                await update.message.reply_text("📭 해당 범위에 메일이 없어요.")
+            else:
+                user_mail_offset[uid] = start + len(page)
+                has_more = bool(user_mail_token.get(uid)) or len(emails) > n
+                msg = _build_mail_msg(emails, start, n, has_more)
+                for i in range(0, len(msg), 4096):
+                    await update.message.reply_text(msg[i:i+4096])
+        except Exception as e:
+            logger.error(f"Gmail until error: {e}")
+            await update.message.reply_text("❌ 메일 불러오기 실패")
 
     elif "[MEMO_DELETE_ALL]" in resp:
         count = delete_all_memos(u.id)
