@@ -871,7 +871,7 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 답변: [웹 검색 후] 의왕시 오늘 23도, 맑아요.
 
 질문: 메일 확인해줘
-답변: [GMAIL_LIST:is:unread]
+답변: [GMAIL_LIST:newer_than:30d]
 
 질문: 다시 보내줘
 답변: [REPEAT_LAST]
@@ -1297,7 +1297,7 @@ async def cmd_mail(update, context):
     query = "newer_than:30d"
     emails, next_token = get_gmail_list(10, query)
     if not emails:
-        await update.message.reply_text("📭 읽지 않은 메일 없음")
+        await update.message.reply_text("📭 최근 30일 메일 없음")
         return
     user_gmail_list[uid] = emails
     user_mail_token[uid] = next_token
@@ -1710,7 +1710,7 @@ async def handle_message(update, context):
 
     elif "[GMAIL_MORE]" in resp:
         uid = u.id
-        query = user_mail_query_store.get(uid, "is:unread")
+        query = user_mail_query_store.get(uid, "newer_than:30d")
         start = user_mail_offset.get(uid, 0)
         end = start + 10
         emails = _fetch_until(uid, end, query)
@@ -1728,7 +1728,7 @@ async def handle_message(update, context):
         try:
             n = int(resp.split("[GMAIL_UNTIL:")[1].split("]")[0])
             uid = u.id
-            query = user_mail_query_store.get(uid, "is:unread")
+            query = user_mail_query_store.get(uid, "newer_than:30d")
             start = user_mail_offset.get(uid, 0)
             emails = _fetch_until(uid, n, query)
             page = emails[start:n]
@@ -1820,8 +1820,7 @@ def main():
         filters.Document.MimeType("video/mp4"),
         handle_audio_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("=== HANDLERS REGISTERED ===", flush=True)
-    print(f"Total handlers: {len(app.handlers[0])}", flush=True)
+    logger.info(f"Handlers registered: {len(app.handlers[0])}")
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_schedules, "interval", minutes=1, args=[app])
