@@ -838,7 +838,7 @@ async def handle_audio_file(update, context):
         await update.message.reply_text("❌ 음성 인식 실패")
 
 async def handle_photo(update, context):
-    logger.info("=== PHOTO HANDLER TRIGGERED ===")
+    print("=== PHOTO HANDLER TRIGGERED ===", flush=True)
     u = update.effective_user
     if not is_authorized(u.id):
         await update.message.reply_text("Access denied.")
@@ -1083,6 +1083,8 @@ def main():
         filters.Document.MimeType("video/mp4"),
         handle_audio_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("=== HANDLERS REGISTERED ===", flush=True)
+    print(f"Total handlers: {len(app.handlers[0])}", flush=True)
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_new_gmail, "interval", minutes=60, args=[app])
