@@ -848,11 +848,11 @@ async def cmd_help(update, context):
         "📬 메일: /mail, '받은 메일 보여줘'\n"
         "🎙️ 음성: 음성/m4a 파일 보내면 자동 분석\n"
         "📝 메모: /memo [내용], /memos\n"
-        "📰 뉴스: /뉴스 키워드1, 키워드2\n"
+        "📰 뉴스: /news 키워드1, 키워드2\n"
         "🔄 반복: '다시 보내줘'\n\n"
         "/clear - 초기화")
 
-async def cmd_뉴스(update, context):
+async def cmd_news(update, context):
     uid = update.effective_user.id
     if not is_authorized(uid): return
     if not DATABASE_URL:
@@ -860,7 +860,7 @@ async def cmd_뉴스(update, context):
         return
     text = " ".join(context.args).strip()
     if not text:
-        await update.message.reply_text("사용법: /뉴스 키워드1, 키워드2, 키워드3")
+        await update.message.reply_text("사용법: /news 키워드1, 키워드2, 키워드3")
         return
     keywords = [kw.strip() for kw in text.split(",") if kw.strip()]
     save_news_keywords(uid, keywords)
@@ -868,19 +868,19 @@ async def cmd_뉴스(update, context):
         f"✅ 키워드 저장 완료!\n\n저장된 키워드: {', '.join(keywords)}\n\n매일 오전 10시에 뉴스 브리핑 보내드릴게요."
     )
 
-async def cmd_뉴스목록(update, context):
+async def cmd_newslist(update, context):
     uid = update.effective_user.id
     if not is_authorized(uid): return
     rows = get_news_keywords(uid)
     if not rows:
-        await update.message.reply_text("저장된 키워드 없음\n\n/뉴스 키워드1, 키워드2 로 추가하세요.")
+        await update.message.reply_text("저장된 키워드 없음\n\n/news 키워드1, 키워드2 로 추가하세요.")
         return
     msg = "📰 저장된 뉴스 키워드:\n\n"
     for i, (_, kw) in enumerate(rows, 1):
         msg += f"{i}. {kw}\n"
     await update.message.reply_text(msg)
 
-async def cmd_뉴스삭제(update, context):
+async def cmd_newsdel(update, context):
     uid = update.effective_user.id
     if not is_authorized(uid): return
     keyword = " ".join(context.args).strip()
@@ -1231,9 +1231,9 @@ def main():
     app.add_handler(CommandHandler("files", cmd_files))
     app.add_handler(CommandHandler("mail", cmd_mail))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("뉴스", cmd_뉴스))
-    app.add_handler(CommandHandler("뉴스목록", cmd_뉴스목록))
-    app.add_handler(CommandHandler("뉴스삭제", cmd_뉴스삭제))
+    app.add_handler(CommandHandler("news", cmd_news))
+    app.add_handler(CommandHandler("newslist", cmd_newslist))
+    app.add_handler(CommandHandler("newsdel", cmd_newsdel))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
