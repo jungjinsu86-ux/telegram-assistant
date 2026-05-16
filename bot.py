@@ -7,7 +7,7 @@ from email import encoders
 from datetime import datetime
 from collections import defaultdict
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import anthropic
 from google.oauth2 import service_account
@@ -37,7 +37,7 @@ clova_available = bool(CLOVA_INVOKE_URL and CLOVA_SECRET_KEY)
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 conversation_history = defaultdict(list)
 MAX_HISTORY = 20
 
@@ -109,19 +109,6 @@ def get_memos(user_id, limit=10):
     except Exception as e:
         logger.error(f"Memo get error: {e}")
         return []
-
-def delete_memo(user_id, memo_id):
-    if not DATABASE_URL:
-        return
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM memos WHERE user_id=%s AND id=%s", (user_id, memo_id))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Memo delete error: {e}")
 
 def get_memos_for_prompt(user_id):
     memos = get_memos(user_id, 5)
@@ -594,7 +581,7 @@ def _select_image_prompt(text):
         return IMAGE_SYSTEM_PROMPT, text or "이 디자인을 전문적으로 분석하고 피드백해주세요"
 
 async def _call_vision(b64, mime_type, system_prompt, prompt, update):
-    r = client.messages.create(
+    r = await client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=4096,
         system=system_prompt,
@@ -627,7 +614,7 @@ async def ask_claude(user_id, message):
     if len(history) > MAX_HISTORY:
         history[:] = history[-MAX_HISTORY:]
     try:
-        r = client.messages.create(
+        r = await client.messages.create(
             model="claude-sonnet-4-6", max_tokens=4096,
             system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
@@ -799,7 +786,9 @@ async def handle_voice(update, context):
         return
     txt = transcribe_audio(bytes(data), voice.mime_type or "audio/ogg")
     if txt:
-        await update.message.reply_text(f"📝 텍스트:\n\n{txt}")
+        transcript = f"📝 텍스트:\n\n{txt}"
+        for i in range(0, len(transcript), 4096):
+            await update.message.reply_text(transcript[i:i+4096])
         analysis = await ask_claude(u.id, f"다음 음성 내용을 분석하고 요약해줘:\n\n{txt}")
         full = f"🔍 분석:\n\n{analysis}"
         for i in range(0, len(full), 4096):
@@ -1043,7 +1032,9 @@ async def handle_message(update, context):
                     else:
                         await update.message.reply_text(msg)
                     summary = await ask_claude(u.id, f"이 메일 내용을 간단히 요약해줘:\n{content['body']}")
-                    await update.message.reply_text(f"🔍 요약: {summary}")
+                    full_summary = f"🔍 요약: {summary}"
+                    for i in range(0, len(full_summary), 4096):
+                        await update.message.reply_text(full_summary[i:i+4096])
                 else:
                     await update.message.reply_text("❌ 메일 읽기 실패")
             else:
