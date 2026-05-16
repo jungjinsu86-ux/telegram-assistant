@@ -1472,7 +1472,6 @@ async def handle_audio_file(update, context):
         await update.message.reply_text("❌ 음성 인식 실패")
 
 async def handle_photo(update, context):
-
     u = update.effective_user
     if not is_authorized(u.id):
         await update.message.reply_text("Access denied.")
@@ -1575,7 +1574,8 @@ async def handle_message(update, context):
         return
 
     if "[DRIVE_SEARCH:" in resp:
-        kw = resp.split("[DRIVE_SEARCH:")[1].split("]")[0]
+        m = re.search(r"\[DRIVE_SEARCH:(.*)\]", resp)
+        kw = m.group(1) if m else ""
         files = search_drive_files(kw)
         if files:
             user_search_results[u.id] = files
@@ -1764,7 +1764,8 @@ async def handle_message(update, context):
 
     elif "[SCHEDULE:" in resp:
         try:
-            inner = resp.split("[SCHEDULE:")[1].split("]")[0]
+            m = re.search(r"\[SCHEDULE:(.*)\]", resp)
+            inner = m.group(1) if m else ""
             dt_str, msg_content = inner.split("|", 1)
             scheduled_at = datetime.strptime(dt_str.strip(), "%Y-%m-%d %H:%M")
             if scheduled_at <= kst_now():
