@@ -10,6 +10,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import anthropic
+from openai import AsyncOpenAI
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -33,13 +34,17 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 CLOVA_INVOKE_URL = os.environ.get("CLOVA_INVOKE_URL", "")
 CLOVA_SECRET_KEY = os.environ.get("CLOVA_SECRET_KEY", "")
 clova_available = bool(CLOVA_INVOKE_URL and CLOVA_SECRET_KEY)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 conversation_history = defaultdict(list)
 MAX_HISTORY = 20
+
+BOTH_KEYWORDS = {"둘다", "둘 다", "둘이", "둘의견", "너희둘", "너희 둘", "둘얘기", "둘이얘기"}
 
 def kst_now():
     return datetime.utcnow() + timedelta(hours=9)
@@ -925,6 +930,54 @@ user_gmail_list = defaultdict(list)
 user_last_action = defaultdict(dict)
 user_last_photo = {}
 
+async def ask_gpt(message):
+    if not openai_client:
+        return "❌ OPENAI_API_KEY 미설정"
+    try:
+        r = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": message}],
+            max_tokens=2048,
+        )
+        return r.choices[0].message.content or "응답 없음"
+    except Exception as e:
+        logger.error(f"GPT error: {e}")
+        return f"❌ GPT 오류: {e}"
+
+async def ask_both(question):
+    claude_task = asyncio.create_task(ask_claude_simple(question))
+    gpt_task = asyncio.create_task(ask_gpt(question))
+    claude_ans, gpt_ans = await asyncio.gather(claude_task, gpt_task)
+    return f"🧠 Claude:\n{claude_ans}\n\n---\n\n🤖 GPT-4o:\n{gpt_ans}"
+
+async def ask_claude_simple(message):
+    """대화 이력 없이 단순 Claude 호출 (both 전용)"""
+    try:
+        r = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": message}],
+        )
+        parts = [b.text for b in r.content if b.type == "text"]
+        return "\n".join(parts) if parts else "응답 없음"
+    except Exception as e:
+        logger.error(f"Claude simple error: {e}")
+        return f"❌ Claude 오류: {e}"
+
+async def cmd_both(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid):
+        await update.message.reply_text("Access denied.")
+        return
+    question = " ".join(context.args).strip()
+    if not question:
+        await update.message.reply_text("사용법: /both [질문]\n예: /both 인스타 팔로워 늘리는 방법")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    result = await ask_both(question)
+    for i in range(0, len(result), 4096):
+        await update.message.reply_text(result[i:i+4096])
+
 async def ask_claude(user_id, message):
     history = conversation_history[user_id]
     memos = get_memos_for_prompt(user_id)
@@ -1376,6 +1429,14 @@ async def handle_message(update, context):
             await update.message.reply_text(f"❌ 이미지 분석 오류: {e}")
         return
 
+    # 양쪽 AI 비교 키워드 감지
+    if any(kw in text for kw in BOTH_KEYWORDS):
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        result = await ask_both(text)
+        for i in range(0, len(result), 4096):
+            await update.message.reply_text(result[i:i+4096])
+        return
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     resp = await ask_claude(u.id, text)
 
@@ -1583,6 +1644,7 @@ def main():
     init_db()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("both", cmd_both))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("memo", cmd_memo))
