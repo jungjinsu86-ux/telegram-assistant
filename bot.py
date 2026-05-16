@@ -1,4 +1,4 @@
-import os, json, logging, io, base64, asyncio
+import os, json, logging, io, base64, asyncio, re
 import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -487,23 +487,56 @@ def get_gmail_list(max_results=10, query="is:unread"):
                 "subject": headers.get("Subject", ""),
                 "date": headers.get("Date", ""),
                 "snippet": msg.get("snippet", ""),
+                "internal_date": msg.get("internalDate", "0"),
             })
         return emails
     except Exception as e:
         logger.error(f"Gmail list error: {e}")
         return []
 
-def _extract_body(payload):
-    """Gmail 중첩 multipart 구조에서 text/plain 재귀 탐색"""
+def _strip_html(html):
+    text = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+def _find_plain(payload):
     if payload.get("mimeType") == "text/plain":
         data = payload.get("body", {}).get("data", "")
         if data:
             return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
     for part in payload.get("parts", []):
-        result = _extract_body(part)
+        result = _find_plain(part)
         if result:
             return result
     return ""
+
+def _find_html(payload):
+    if payload.get("mimeType") == "text/html":
+        data = payload.get("body", {}).get("data", "")
+        if data:
+            return _strip_html(base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore"))
+    for part in payload.get("parts", []):
+        result = _find_html(part)
+        if result:
+            return result
+    return ""
+
+def _extract_body(payload):
+    return _find_plain(payload) or _find_html(payload)
+
+def _format_kst_time(internal_date_ms):
+    try:
+        ts = int(internal_date_ms) / 1000
+        dt = datetime.utcfromtimestamp(ts) + timedelta(hours=9)
+        hour = dt.hour
+        ampm = "오전" if hour < 12 else "오후"
+        h12 = hour % 12 or 12
+        return f"{dt.year}.{dt.month:02d}.{dt.day:02d} {ampm} {h12}:{dt.minute:02d}"
+    except Exception:
+        return ""
 
 def get_gmail_content(msg_id):
     if not gmail_service:
@@ -514,11 +547,13 @@ def get_gmail_content(msg_id):
         ).execute()
         headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
         body = _extract_body(msg["payload"])
+        body_preview = body[:1000] + "\n\n...더 있음" if len(body) > 1000 else body
         return {
             "from": headers.get("From", ""),
             "subject": headers.get("Subject", ""),
             "date": headers.get("Date", ""),
             "body": body[:3000],
+            "body_preview": body_preview,
         }
     except Exception as e:
         logger.error(f"Gmail read error: {e}")
@@ -1191,7 +1226,11 @@ async def cmd_mail(update, context):
     for i, e in enumerate(emails, 1):
         sender = e["from"].split("<")[0].strip()[:20]
         subject = e["subject"][:30]
-        msg += f"{i}. 👤 {sender}\n   📌 {subject}\n\n"
+        time_str = _format_kst_time(e.get("internal_date", "0"))
+        msg += f"{i}. 📧 {sender}\n   📌 {subject}\n"
+        if time_str:
+            msg += f"   🕐 {time_str}\n"
+        msg += "\n"
     msg += "💡 '1번 메일 읽어줘'라고 하세요!"
     for i in range(0, len(msg), 4096):
         await update.message.reply_text(msg[i:i+4096])
@@ -1559,7 +1598,11 @@ async def handle_message(update, context):
             for i, e in enumerate(emails, 1):
                 sender = e["from"].split("<")[0].strip()[:20]
                 subject = e["subject"][:30]
-                msg += f"{i}. 👤 {sender}\n   📌 {subject}\n\n"
+                time_str = _format_kst_time(e.get("internal_date", "0"))
+                msg += f"{i}. 📧 {sender}\n   📌 {subject}\n"
+                if time_str:
+                    msg += f"   🕐 {time_str}\n"
+                msg += "\n"
             msg += "💡 '1번 메일 읽어줘'라고 하세요!"
             for i in range(0, len(msg), 4096):
                 await update.message.reply_text(msg[i:i+4096])
@@ -1574,11 +1617,12 @@ async def handle_message(update, context):
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
                 content = get_gmail_content(emails[num]["id"])
                 if content:
+                    body_display = content.get("body_preview") or content["body"][:1000]
                     msg = (f"📧 메일 내용\n\n"
                            f"👤 {content['from']}\n"
                            f"📌 {content['subject']}\n"
                            f"📅 {content['date']}\n\n"
-                           f"📝 내용:\n{content['body']}")
+                           f"📝 내용:\n{body_display}")
                     if len(msg) > 4096:
                         for i in range(0, len(msg), 4096):
                             await update.message.reply_text(msg[i:i+4096])
