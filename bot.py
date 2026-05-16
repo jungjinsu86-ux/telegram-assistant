@@ -970,7 +970,7 @@ async def ask_gpt(message):
         return "❌ OPENAI_API_KEY 미설정"
     try:
         r = await openai_client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-search-preview",
             messages=[{"role": "user", "content": message}],
             max_tokens=2048,
         )
@@ -983,7 +983,7 @@ async def ask_both(question):
     claude_task = asyncio.create_task(ask_claude_simple(question))
     gpt_task = asyncio.create_task(ask_gpt(question))
     claude_ans, gpt_ans = await asyncio.gather(claude_task, gpt_task)
-    return f"🧠 Claude:\n{claude_ans}\n\n---\n\n🤖 GPT-4o:\n{gpt_ans}"
+    return f"🧠 Claude:\n{claude_ans}\n\n---\n\n🤖 GPT-4o Search:\n{gpt_ans}"
 
 async def ask_claude_simple(message):
     """대화 이력 없이 단순 Claude 호출 (both 전용)"""
@@ -991,6 +991,7 @@ async def ask_claude_simple(message):
         r = await client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=2048,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
             messages=[{"role": "user", "content": message}],
         )
         parts = [b.text for b in r.content if b.type == "text"]
