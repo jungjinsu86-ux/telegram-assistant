@@ -1,4 +1,4 @@
-import os, json, logging, io, base64
+import os, json, logging, io, base64, asyncio
 import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -79,8 +79,18 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT,
                 keyword TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (user_id, keyword)
             )
+        """)
+        cur.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname='news_keywords_user_keyword_unique'
+                ) THEN
+                    ALTER TABLE news_keywords ADD CONSTRAINT news_keywords_user_keyword_unique UNIQUE (user_id, keyword);
+                END IF;
+            END $$;
         """)
         cur.execute("DELETE FROM notified_mail_ids WHERE notified_at < NOW() - INTERVAL '7 days'")
         conn.commit()
@@ -137,7 +147,7 @@ def save_news_keywords(user_id, keywords):
             kw = kw.strip()
             if kw:
                 cur.execute(
-                    "INSERT INTO news_keywords (user_id, keyword) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    "INSERT INTO news_keywords (user_id, keyword) VALUES (%s, %s) ON CONFLICT (user_id, keyword) DO NOTHING",
                     (user_id, kw)
                 )
         conn.commit()
@@ -694,9 +704,10 @@ async def ask_claude(user_id, message):
         # 텍스트만 저장 (토큰 절약)
         history.append({"role": "assistant", "content": txt})
         return txt
-    except anthropic.APIError as e:
+    except Exception as e:
         logger.error(f"Claude error: {e}")
-        history.pop()
+        if history and history[-1]["role"] == "user":
+            history.pop()
         return "⚠️ AI 오류. 잠시 후 다시 시도하세요."
 
 # ── Gmail 자동 체크 (1시간마다)
@@ -784,7 +795,8 @@ async def cmd_memos(update, context):
     msg = "📝 저장된 메모:\n\n"
     for i, (content, created_at) in enumerate(memos, 1):
         msg += f"{i}. {content} ({created_at.strftime('%m/%d %H:%M')})\n"
-    await update.message.reply_text(msg)
+    for i in range(0, len(msg), 4096):
+        await update.message.reply_text(msg[i:i+4096])
 
 async def cmd_files(update, context):
     uid = update.effective_user.id
@@ -802,7 +814,8 @@ async def cmd_files(update, context):
     for i, f in enumerate(files, 1):
         msg += f"{i}. 📄 {f['name']} ({f.get('modifiedTime','')[:10]})\n"
     msg += "\n💡 번호로 전송/이메일 첨부 가능!"
-    await update.message.reply_text(msg)
+    for i in range(0, len(msg), 4096):
+        await update.message.reply_text(msg[i:i+4096])
 
 async def cmd_mail(update, context):
     uid = update.effective_user.id
@@ -822,7 +835,8 @@ async def cmd_mail(update, context):
         subject = e["subject"][:30]
         msg += f"{i}. 👤 {sender}\n   📌 {subject}\n\n"
     msg += "💡 '1번 메일 읽어줘'라고 하세요!"
-    await update.message.reply_text(msg)
+    for i in range(0, len(msg), 4096):
+        await update.message.reply_text(msg[i:i+4096])
 
 async def cmd_help(update, context):
     if not is_authorized(update.effective_user.id): return
@@ -936,7 +950,8 @@ async def handle_voice(update, context):
         logger.error(f"Voice download error: {e}")
         await update.message.reply_text("❌ 파일 다운로드 실패")
         return
-    txt = transcribe_audio(bytes(data), voice.mime_type or "audio/ogg")
+    loop = asyncio.get_event_loop()
+    txt = await loop.run_in_executor(None, transcribe_audio, bytes(data), voice.mime_type or "audio/ogg")
     if txt:
         transcript = f"📝 텍스트:\n\n{txt}"
         for i in range(0, len(transcript), 4096):
@@ -963,7 +978,8 @@ async def handle_audio_file(update, context):
         logger.error(f"Audio download error: {e}")
         await update.message.reply_text("❌ 파일 다운로드 실패")
         return
-    txt = transcribe_audio(bytes(data), audio.mime_type or "audio/mpeg")
+    loop = asyncio.get_event_loop()
+    txt = await loop.run_in_executor(None, transcribe_audio, bytes(data), audio.mime_type or "audio/mpeg")
     if txt:
         if len(txt) > 3000:
             for i in range(0, len(txt), 3000):
@@ -1075,7 +1091,8 @@ async def handle_message(update, context):
             for i, f in enumerate(files, 1):
                 msg += f"{i}. 📄 {f['name']} ({f.get('modifiedTime','')[:10]})\n"
             msg += "\n💡 번호로 전송/이메일 첨부 가능!"
-            await update.message.reply_text(msg)
+            for i in range(0, len(msg), 4096):
+                await update.message.reply_text(msg[i:i+4096])
         else:
             await update.message.reply_text(f"'{kw}' 결과 없음")
 
@@ -1086,7 +1103,8 @@ async def handle_message(update, context):
             msg = "📁 파일 목록:\n\n"
             for i, f in enumerate(files, 1):
                 msg += f"{i}. 📄 {f['name']} ({f.get('modifiedTime','')[:10]})\n"
-            await update.message.reply_text(msg)
+            for i in range(0, len(msg), 4096):
+                await update.message.reply_text(msg[i:i+4096])
         else:
             await update.message.reply_text("파일 없음")
 
@@ -1161,7 +1179,8 @@ async def handle_message(update, context):
                 subject = e["subject"][:30]
                 msg += f"{i}. 👤 {sender}\n   📌 {subject}\n\n"
             msg += "💡 '1번 메일 읽어줘'라고 하세요!"
-            await update.message.reply_text(msg)
+            for i in range(0, len(msg), 4096):
+                await update.message.reply_text(msg[i:i+4096])
         else:
             await update.message.reply_text("📭 메일 없음")
 
