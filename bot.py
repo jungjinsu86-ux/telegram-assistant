@@ -972,7 +972,7 @@ async def ask_gpt(message):
         r = await openai_client.chat.completions.create(
             model="gpt-4o-search-preview",
             messages=[{"role": "user", "content": message}],
-            max_tokens=2048,
+            max_completion_tokens=2048,
         )
         return r.choices[0].message.content or "응답 없음"
     except Exception as e:
@@ -1400,7 +1400,7 @@ async def handle_audio_file(update, context):
         await update.message.reply_text("❌ 음성 인식 실패")
 
 async def handle_photo(update, context):
-    print("=== PHOTO HANDLER TRIGGERED ===", flush=True)
+
     u = update.effective_user
     if not is_authorized(u.id):
         await update.message.reply_text("Access denied.")
@@ -1550,8 +1550,8 @@ async def handle_message(update, context):
 
     elif "[EMAIL_WITH_FILE:" in resp:
         try:
-            # maxsplit=3 으로 본문 내 | 포함 허용
-            parts = resp.split("[EMAIL_WITH_FILE:")[1].split("]")[0].split("|", 3)
+            m = re.search(r"\[EMAIL_WITH_FILE:(.*)\]", resp)
+            parts = m.group(1).split("|", 3) if m else []
             to_addr, subject, body, fnum = parts[0], parts[1], parts[2], int(parts[3]) - 1
             files = user_search_results.get(u.id, [])
             if 0 <= fnum < len(files):
@@ -1575,8 +1575,8 @@ async def handle_message(update, context):
 
     elif "[EMAIL:" in resp:
         try:
-            # maxsplit=2 으로 본문 내 | 포함 허용
-            parts = resp.split("[EMAIL:")[1].split("]")[0].split("|", 2)
+            m = re.search(r"\[EMAIL:(.*)\]", resp)
+            parts = m.group(1).split("|", 2) if m else []
             to_addr, subject, body = parts[0], parts[1], parts[2]
             await update.message.reply_text(f"📧 {to_addr}로 전송 중...")
             ok, msg = send_gmail(to_addr, subject, body)
@@ -1618,7 +1618,7 @@ async def handle_message(update, context):
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
                 content = get_gmail_content(emails[num]["id"])
                 if content:
-                    body_display = content.get("body_preview") or content["body"][:1000]
+                    body_display = content.get("body_preview") or content["body"][:1000] or "본문 없음"
                     msg = (f"📧 메일 내용\n\n"
                            f"👤 {content['from']}\n"
                            f"📌 {content['subject']}\n"
