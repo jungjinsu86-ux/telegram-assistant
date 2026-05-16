@@ -44,7 +44,7 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 conversation_history = defaultdict(list)
 MAX_HISTORY = 20
 
-BOTH_KEYWORDS = {"둘다", "둘 다", "둘이", "둘의견", "너희둘", "너희 둘", "둘얘기", "둘이얘기"}
+BOTH_KEYWORDS = {"둘다", "둘 다", "너희둘", "너희 둘", "둘이", "둘의견", "둘다말해", "둘다얘기"}
 
 def kst_now():
     return datetime.utcnow() + timedelta(hours=9)
@@ -466,7 +466,7 @@ def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
         return False, str(e)
 
 # ── Gmail read
-def get_gmail_list(max_results=10, query="is:unread", page_token=None):
+def get_gmail_list(max_results=10, query="newer_than:30d", page_token=None):
     if not gmail_service:
         return [], None
     try:
@@ -688,6 +688,17 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 - 이미지/디자인 생성은 불가능. 요청 시 '이미지 생성은 불가하지만 텍스트 콘텐츠 초안은 작성 가능합니다'라고 안내할 것
 - 대화 중 맥락이 이어지는 요청(예: '위에 내용 기반으로', '이걸로', '위 내용으로')이 오면 이전 대화 내용을 그대로 활용해서 바로 결과를 출력할 것. 추가 질문 금지.
 
+== 보스 정확한 정보 (검색 결과보다 이 정보 우선) ==
+- 이름: 정진수 (스타강사 정)
+- 저서: 총 13권
+- 대한민국 최초 인스타그램 마케팅 책 출간
+- 강의 분야: SNS 마케팅, 인스타그램, 유튜브, AI 활용
+- 주력 플랫폼: 인스타그램, 네이버 블로그, 유튜브
+- 이미 알고 있는 정보는 다시 묻지 말 것
+- 이미지/디자인 생성은 불가능. 요청 시 '이미지 생성은 불가하지만 텍스트 콘텐츠 초안은 작성 가능합니다'라고 안내할 것
+- 대화 중 맥락이 이어지는 요청(예: '위에 내용 기반으로', '이걸로', '위 내용으로')이 오면 이전 대화 내용을 그대로 활용해서 바로 결과를 출력할 것. 추가 질문 금지.
+- 보스에 대한 정보는 위 내용을 기준으로 답변하고 검색 결과와 다르면 위 내용을 따를 것
+
 ━━━━━━━━━━━━━━━━━━━━━━━
 🧠 핵심 원칙
 ━━━━━━━━━━━━━━━━━━━━━━━
@@ -758,8 +769,9 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 ━━━━━━━━━━━━━━━━━━━━━━━
 📬 메일 읽기 규칙
 ━━━━━━━━━━━━━━━━━━━━━━━
-"메일 확인", "받은 메일" → [GMAIL_LIST:is:unread]
+"메일 확인", "받은 메일", "최근 메일" → [GMAIL_LIST:newer_than:30d]
 "오늘 온 메일" → [GMAIL_LIST:newer_than:1d]
+"안 읽은 메일" → [GMAIL_LIST:is:unread]
 "○○한테서 온 메일" → [GMAIL_LIST:from:○○]
 "1번 메일 읽어줘" → [GMAIL_READ:1]
 "다음 메일", "더 보여줘", "11번부터" → [GMAIL_MORE]
@@ -1006,13 +1018,32 @@ user_mail_offset = {}    # uid -> 다음 표시 시작 인덱스 (0-based)
 user_mail_token = {}     # uid -> nextPageToken (None이면 마지막 페이지)
 user_mail_query_store = {}  # uid -> 현재 페이지네이션 중인 Gmail 쿼리
 
+_GPT_BOTH_SYSTEM = (
+    "반드시 2025년 이후 최신 자료만 사용할 것. "
+    "오래된 자료(2024년 이전)는 사용 금지. "
+    "검색 시 2026년 기준 최신 정보 우선. "
+    "날짜가 명확한 자료만 인용할 것."
+)
+
+_CLAUDE_BOTH_SYSTEM = (
+    "최신 정보를 웹에서 검색하여 답변할 것. "
+    "검색 결과는 최신순으로 정렬. "
+    "각 정보마다 출처 URL 반드시 포함. "
+    "최소 3개 이상의 실제 출처 기반으로 답변할 것. "
+    "추측이나 일반 지식으로 때우지 말 것."
+)
+
 async def ask_gpt(message):
     if not openai_client:
         return "❌ OPENAI_API_KEY 미설정"
     try:
+        prefixed = f"[2026년 최신 정보 기준으로 답변] {message}"
         r = await openai_client.chat.completions.create(
             model="gpt-4o-search-preview",
-            messages=[{"role": "user", "content": message}],
+            messages=[
+                {"role": "system", "content": _GPT_BOTH_SYSTEM},
+                {"role": "user", "content": prefixed},
+            ],
             max_completion_tokens=2048,
         )
         return r.choices[0].message.content or "응답 없음"
@@ -1032,7 +1063,8 @@ async def ask_claude_simple(message):
         r = await client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=2048,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+            system=_CLAUDE_BOTH_SYSTEM,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
             messages=[{"role": "user", "content": message}],
         )
         parts = [b.text for b in r.content if b.type == "text"]
@@ -1262,7 +1294,7 @@ async def cmd_mail(update, context):
         await update.message.reply_text("❌ Gmail 미연결")
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    query = "is:unread"
+    query = "newer_than:30d"
     emails, next_token = get_gmail_list(10, query)
     if not emails:
         await update.message.reply_text("📭 읽지 않은 메일 없음")
