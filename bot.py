@@ -4,7 +4,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 conversation_history = defaultdict(list)
 MAX_HISTORY = 20
+
+def kst_now():
+    return datetime.utcnow() + timedelta(hours=9)
 
 # ── DB 초기화
 def get_db():
@@ -84,15 +87,17 @@ def init_db():
             )
         """)
         cur.execute("""
-            DO $$ BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint WHERE conname='news_keywords_user_keyword_unique'
-                ) THEN
-                    ALTER TABLE news_keywords ADD CONSTRAINT news_keywords_user_keyword_unique UNIQUE (user_id, keyword);
-                END IF;
-            END $$;
+            CREATE TABLE IF NOT EXISTS schedules (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                message TEXT,
+                scheduled_at TIMESTAMP,
+                sent BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
         """)
         cur.execute("DELETE FROM notified_mail_ids WHERE notified_at < NOW() - INTERVAL '7 days'")
+        cur.execute("DELETE FROM schedules WHERE sent = TRUE AND created_at < NOW() - INTERVAL '30 days'")
         conn.commit()
         cur.close()
         conn.close()
@@ -119,7 +124,10 @@ def get_memos(user_id, limit=10):
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT content, created_at FROM memos WHERE user_id=%s ORDER BY created_at DESC LIMIT %s", (user_id, limit))
+        cur.execute(
+            "SELECT id, content, created_at FROM memos WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+            (user_id, limit)
+        )
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -133,9 +141,50 @@ def get_memos_for_prompt(user_id):
     if not memos:
         return ""
     text = "\n[저장된 메모]\n"
-    for content, created_at in memos:
+    for _, content, created_at in memos:
         text += f"- {content} ({created_at.strftime('%m/%d')})\n"
     return text
+
+def delete_memo_by_number(user_id, number):
+    if not DATABASE_URL:
+        return False
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM memos WHERE user_id=%s ORDER BY created_at DESC LIMIT 10",
+            (user_id,)
+        )
+        rows = cur.fetchall()
+        if 0 <= number - 1 < len(rows):
+            memo_id = rows[number - 1][0]
+            cur.execute("DELETE FROM memos WHERE id=%s AND user_id=%s", (memo_id, user_id))
+            conn.commit()
+            cur.close()
+            conn.close()
+            return True
+        cur.close()
+        conn.close()
+        return False
+    except Exception as e:
+        logger.error(f"Memo delete error: {e}")
+        return False
+
+def delete_all_memos(user_id):
+    if not DATABASE_URL:
+        return 0
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM memos WHERE user_id=%s", (user_id,))
+        count = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return count
+    except Exception as e:
+        logger.error(f"Memo delete all error: {e}")
+        return 0
 
 def save_news_keywords(user_id, keywords):
     if not DATABASE_URL:
@@ -188,6 +237,99 @@ def delete_news_keyword(user_id, keyword):
         return deleted
     except Exception as e:
         logger.error(f"News keyword delete error: {e}")
+        return False
+
+# ── 알림 스케줄 함수
+def save_schedule(user_id, message, scheduled_at):
+    if not DATABASE_URL:
+        return False
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO schedules (user_id, message, scheduled_at) VALUES (%s, %s, %s)",
+            (user_id, message, scheduled_at)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Schedule save error: {e}")
+        return False
+
+def get_pending_schedules():
+    if not DATABASE_URL:
+        return []
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, user_id, message FROM schedules WHERE scheduled_at <= %s AND sent = FALSE",
+            (kst_now(),)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"Schedule get pending error: {e}")
+        return []
+
+def mark_schedule_sent(schedule_id):
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE schedules SET sent = TRUE WHERE id = %s", (schedule_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Schedule mark sent error: {e}")
+
+def get_user_schedules(user_id):
+    if not DATABASE_URL:
+        return []
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, message, scheduled_at FROM schedules WHERE user_id=%s AND sent=FALSE AND scheduled_at > %s ORDER BY scheduled_at LIMIT 20",
+            (user_id, kst_now())
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"Schedule list error: {e}")
+        return []
+
+def delete_schedule_by_number(user_id, number):
+    if not DATABASE_URL:
+        return False
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM schedules WHERE user_id=%s AND sent=FALSE AND scheduled_at > %s ORDER BY scheduled_at LIMIT 20",
+            (user_id, kst_now())
+        )
+        rows = cur.fetchall()
+        if 0 <= number - 1 < len(rows):
+            schedule_id = rows[number - 1][0]
+            cur.execute("DELETE FROM schedules WHERE id=%s AND user_id=%s", (schedule_id, user_id))
+            conn.commit()
+            cur.close()
+            conn.close()
+            return True
+        cur.close()
+        conn.close()
+        return False
+    except Exception as e:
+        logger.error(f"Schedule delete error: {e}")
         return False
 
 # ── Google Drive
@@ -346,6 +488,18 @@ def get_gmail_list(max_results=10, query="is:unread"):
         logger.error(f"Gmail list error: {e}")
         return []
 
+def _extract_body(payload):
+    """Gmail 중첩 multipart 구조에서 text/plain 재귀 탐색"""
+    if payload.get("mimeType") == "text/plain":
+        data = payload.get("body", {}).get("data", "")
+        if data:
+            return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+    for part in payload.get("parts", []):
+        result = _extract_body(part)
+        if result:
+            return result
+    return ""
+
 def get_gmail_content(msg_id):
     if not gmail_service:
         return None
@@ -354,17 +508,7 @@ def get_gmail_content(msg_id):
             userId="me", id=msg_id, format="full"
         ).execute()
         headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
-        body = ""
-        if "parts" in msg["payload"]:
-            for part in msg["payload"]["parts"]:
-                if part["mimeType"] == "text/plain":
-                    data = part["body"].get("data", "")
-                    body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-                    break
-        else:
-            data = msg["payload"]["body"].get("data", "")
-            if data:
-                body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+        body = _extract_body(msg["payload"])
         return {
             "from": headers.get("From", ""),
             "subject": headers.get("Subject", ""),
@@ -376,7 +520,7 @@ def get_gmail_content(msg_id):
         return None
 
 # ── Speech (CLOVA)
-def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
+def transcribe_audio(audio_bytes, mime_type="audio/ogg", enable_diarization=True):
     if not clova_available:
         return None
     try:
@@ -384,18 +528,19 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
             "Accept": "application/json;UTF-8",
             "X-CLOVASPEECH-API-KEY": CLOVA_SECRET_KEY,
         }
+        params = {
+            "language": "ko-KR",
+            "completion": "sync",
+            "speaker": enable_diarization,
+            "diarization": {
+                "enable": enable_diarization,
+                "speakerCountMin": 2,
+                "speakerCountMax": 2,
+            } if enable_diarization else {"enable": False},
+        }
         files = {
             "media": ("audio.m4a", audio_bytes, mime_type),
-            "params": (None, json.dumps({
-                "language": "ko-KR",
-                "completion": "sync",
-                "speaker": True,
-                "diarization": {
-                    "enable": True,
-                    "speakerCountMin": 2,
-                    "speakerCountMax": 2,
-                },
-            }), "application/json"),
+            "params": (None, json.dumps(params), "application/json"),
         }
         response = requests.post(
             CLOVA_INVOKE_URL + "/recognizer/upload",
@@ -409,7 +554,7 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
             if segments:
                 txt = ""
                 for seg in segments:
-                    speaker = seg.get("diarization", {}).get("label", "")
+                    speaker = seg.get("diarization", {}).get("label", "") if enable_diarization else ""
                     text = seg.get("text", "")
                     if speaker:
                         txt += f"[화자{speaker}] {text}\n"
@@ -435,6 +580,7 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 - 음성 분석 가능 (m4a, mp3 등)
 - PostgreSQL DB 연동 (메모 저장 가능)
 - 1시간마다 새 메일 자동 체크 중
+- 알림 기능 활성화 (매 1분 체크)
 
 → 서버, API 연동 등 이미 다 세팅되어 있음
 → "설정이 필요하다", "서버가 있어야 한다" 같은 말 하지 말 것
@@ -485,9 +631,11 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 2. Gmail - 누구에게든 전송, 파일 첨부, 받은 메일 읽기/검색/요약
 3. 음성/통화녹음 - m4a, mp3 등 자동 텍스트 변환 + AI 요약
 4. 웹 검색 - 실시간 뉴스, 날씨, 주가, 인물, 기업 정보
-5. 메모 저장/조회 - /memo 로 저장, /memos 로 조회
+5. 메모 저장/조회/삭제 - /memo 저장, /memos 조회, /memodel 삭제
 6. 문서 작성 - 이메일 초안, 보고서, 아이디어 정리
 7. 일반 대화 및 업무 조언
+8. 유튜브 쇼츠 스크립트 - 이미지/키워드로 60초 대본 초안 작성
+9. 알림 설정 - 원하는 시간에 텔레그램 알림 발송 (/schedules 로 조회)
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 📋 명령 형식
@@ -500,6 +648,9 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 [GMAIL_LIST:검색쿼리]
 [GMAIL_READ:번호]
 [REPEAT_LAST]
+[MEMO_DELETE:번호]
+[MEMO_DELETE_ALL]
+[SCHEDULE:YYYY-MM-DD HH:MM|알림내용]
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 📁 파일 처리 규칙
@@ -535,6 +686,46 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 "오늘 온 메일" → [GMAIL_LIST:newer_than:1d]
 "○○한테서 온 메일" → [GMAIL_LIST:from:○○]
 "1번 메일 읽어줘" → [GMAIL_READ:1]
+
+━━━━━━━━━━━━━━━━━━━━━━━
+🗑️ 메모 삭제 규칙
+━━━━━━━━━━━━━━━━━━━━━━━
+"[번호]번 메모 지워", "메모 [번호] 삭제해줘" → [MEMO_DELETE:번호]
+"메모 다 지워", "전부 삭제", "모든 메모 없애줘", "메모 초기화", "다 없애줘" → [MEMO_DELETE_ALL]
+
+━━━━━━━━━━━━━━━━━━━━━━━
+⏰ 알림 설정 규칙
+━━━━━━━━━━━━━━━━━━━━━━━
+- 메시지 앞 [현재 KST: ...]를 보고 현재 한국 시간을 파악할 것
+- "내일 10시에 운동가라고 알려줘" → [SCHEDULE:2026-05-17 10:00|운동 가세요!]
+- "30분 후에 알림줘" → 현재 KST 기준 30분 후 계산 → [SCHEDULE:YYYY-MM-DD HH:MM|내용]
+- "이번 주 금요일 오후 3시에 미팅 알려줘" → 날짜 계산 후 [SCHEDULE:...]
+- 알림 내용은 대표님이 말씀하신 내용 그대로 간결하게 (예: "운동 가세요!", "미팅 시간이에요!")
+- 과거 시간 요청 시 "이미 지난 시간이에요"라고 알릴 것
+- KST 기준으로 날짜/시간 계산할 것
+
+━━━━━━━━━━━━━━━━━━━━━━━
+🎬 유튜브 스크립트 규칙
+━━━━━━━━━━━━━━━━━━━━━━━
+"유튜브 대본", "쇼츠 스크립트", "영상 대본", "쇼츠 대본" 요청 시 아래 형식으로 작성:
+
+🎬 유튜브 쇼츠 스크립트
+---
+[🎣 훅 - 0~3초]
+(시청자 시선 잡는 강렬한 오프닝 - 질문형/충격적 사실/공감)
+[화면: ○○]
+
+[📌 본문 - 3~50초]
+포인트1: (대사) [화면: ○○]
+포인트2: (대사) [화면: ○○]
+포인트3: (대사) [화면: ○○]
+
+[🔔 CTA - 50~60초]
+(구독/좋아요/저장 유도 문구)
+---
+💡 제작 팁: (이 스크립트 핵심 포인트 한 줄)
+
+기준: 60초 이내 / 강사 전문가 톤 / 에너지 있게
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 🔍 웹 검색 규칙
@@ -594,6 +785,12 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 
 질문: 다시 보내줘
 답변: [REPEAT_LAST]
+
+질문: 내일 오전 10시에 운동가라고 알려줘
+답변: [SCHEDULE:2026-05-17 10:00|운동 가세요!]
+
+질문: 메모 다 지워줘
+답변: [MEMO_DELETE_ALL]
 
 규칙: 위 예시처럼 짧고 자연스럽게.
 불필요한 설명, 형식적인 인사, 굵은 글씨 쓰지 말 것."""
@@ -659,10 +856,44 @@ MARKETING_SYSTEM_PROMPT = """당신은 SNS 마케팅 13년 경력의 마케터�
 ⚠️ 개선 포인트
 📈 마케팅 성과를 높이는 제안"""
 
-ANALYSIS_KEYWORDS = {"분석", "피드백", "인스타", "캡션", "마케팅", "마케터", "평가", "리뷰", "봐줘", "어때"}
+YOUTUBE_SYSTEM_PROMPT = """당신은 SNS 마케팅 13년차 전문가의 유튜브 콘텐츠 담당 비서입니다.
+
+이미지 또는 주제를 바탕으로 유튜브 쇼츠 스크립트를 작성합니다.
+
+작성 규칙:
+1. 훅(Hook): 첫 3초 안에 시청자를 잡는 강렬한 오프닝 (질문형/충격적 사실/공감)
+2. 본문: 핵심 내용 3-5개 포인트, 각 포인트 15-20초 분량
+3. CTA: 마지막에 구독/좋아요/저장 유도 문구
+4. 전체 60초 이내 분량
+5. 각 파트에 화면 연출 가이드 포함 (예: [화면: 강사 정면 샷])
+6. 톤: 에너지 있고 빠른 호흡, 전문적이면서 친근하게
+
+출력 형식:
+🎬 유튜브 쇼츠 스크립트
+---
+[🎣 훅 - 0~3초]
+(대사)
+[화면: ○○]
+
+[📌 본문 - 3~50초]
+포인트1: (대사)
+[화면: ○○]
+
+[🔔 CTA - 50~60초]
+(대사)
+---
+💡 제작 팁: (이 스크립트의 핵심 포인트 한 줄)"""
+
+ANALYSIS_KEYWORDS = {
+    "분석", "피드백", "인스타", "캡션", "마케팅", "마케터",
+    "평가", "리뷰", "봐줘", "어때",
+    "유튜브", "쇼츠", "스크립트", "대본",
+}
 
 def _select_image_prompt(text):
-    if any(kw in text for kw in ("인스타", "캡션", "게시물")):
+    if any(kw in text for kw in ("유튜브", "쇼츠", "스크립트", "대본")):
+        return YOUTUBE_SYSTEM_PROMPT, text or "이 이미지를 바탕으로 유튜브 쇼츠 스크립트를 작성해주세요"
+    elif any(kw in text for kw in ("인스타", "캡션", "게시물")):
         return INSTAGRAM_SYSTEM_PROMPT, text or "이 이미지를 바탕으로 인스타그램 게시물 초안을 작성해주세요"
     elif any(kw in text for kw in ("마케팅", "마케터")):
         return MARKETING_SYSTEM_PROMPT, text or "마케터 관점에서 이 이미지를 분석해주세요"
@@ -699,7 +930,7 @@ async def ask_claude(user_id, message):
     memos = get_memos_for_prompt(user_id)
     system = SYSTEM_PROMPT + memos
 
-    history.append({"role": "user", "content": f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}]\n{message}"})
+    history.append({"role": "user", "content": f"[현재 KST: {kst_now().strftime('%Y-%m-%d %H:%M')}]\n{message}"})
     if len(history) > MAX_HISTORY:
         history[:] = history[-MAX_HISTORY:]
     try:
@@ -711,7 +942,6 @@ async def ask_claude(user_id, message):
         )
         text_parts = [block.text for block in r.content if block.type == "text"]
         txt = "\n".join(text_parts) if text_parts else "응답 없음"
-        # 텍스트만 저장 (토큰 절약)
         history.append({"role": "assistant", "content": txt})
         return txt
     except Exception as e:
@@ -720,12 +950,22 @@ async def ask_claude(user_id, message):
             history.pop()
         return "⚠️ AI 오류. 잠시 후 다시 시도하세요."
 
+# ── 알림 체크 (1분마다)
+async def check_schedules(app):
+    pending = get_pending_schedules()
+    for schedule_id, user_id, message in pending:
+        try:
+            await app.bot.send_message(chat_id=user_id, text=f"⏰ 알림\n\n{message}")
+            mark_schedule_sent(schedule_id)
+        except Exception as e:
+            logger.error(f"Schedule send error: {e}")
+
 # ── Gmail 자동 체크 (1시간마다)
 async def check_new_gmail(app):
     if not gmail_service or not ALLOWED_USER_IDS or not DATABASE_URL:
         return
     try:
-        emails = get_gmail_list(10, "is:unread newer_than:1h")
+        emails = get_gmail_list(10, "is:unread newer_than:2h")
         if not emails:
             return
         current_ids = [e["id"] for e in emails]
@@ -772,6 +1012,7 @@ async def cmd_start(update, context):
         f"/mail - 받은 메일\n"
         f"/memo [내용] - 메모 저장\n"
         f"/memos - 메모 목록\n"
+        f"/schedules - 알림 목록\n"
         f"/clear - 초기화\n"
         f"/help - 도움말")
 
@@ -803,10 +1044,64 @@ async def cmd_memos(update, context):
         await update.message.reply_text("저장된 메모 없음")
         return
     msg = "📝 저장된 메모:\n\n"
-    for i, (content, created_at) in enumerate(memos, 1):
+    for i, (_, content, created_at) in enumerate(memos, 1):
         msg += f"{i}. {content} ({created_at.strftime('%m/%d %H:%M')})\n"
     for i in range(0, len(msg), 4096):
         await update.message.reply_text(msg[i:i+4096])
+
+async def cmd_memodel(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid): return
+    if not context.args:
+        await update.message.reply_text("사용법: /memodel [번호]\n예: /memodel 2")
+        return
+    try:
+        num = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("번호를 입력해주세요. 예: /memodel 2")
+        return
+    if delete_memo_by_number(uid, num):
+        await update.message.reply_text(f"✅ {num}번 메모 삭제 완료!")
+    else:
+        await update.message.reply_text(f"❌ {num}번 메모를 찾을 수 없어요.")
+
+async def cmd_memoclear(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid): return
+    count = delete_all_memos(uid)
+    if count > 0:
+        await update.message.reply_text(f"✅ 메모 {count}개 전체 삭제 완료!")
+    else:
+        await update.message.reply_text("삭제할 메모가 없어요.")
+
+async def cmd_schedules(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid): return
+    rows = get_user_schedules(uid)
+    if not rows:
+        await update.message.reply_text("예정된 알림 없음\n\n예: '내일 오전 10시에 운동가라고 알려줘'")
+        return
+    msg = "⏰ 예정된 알림:\n\n"
+    for i, (_, message, scheduled_at) in enumerate(rows, 1):
+        msg += f"{i}. {scheduled_at.strftime('%m/%d %H:%M')} - {message}\n"
+    msg += "\n💡 /scheduledel [번호] 로 삭제"
+    await update.message.reply_text(msg)
+
+async def cmd_scheduledel(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid): return
+    if not context.args:
+        await update.message.reply_text("사용법: /scheduledel [번호]\n예: /scheduledel 1")
+        return
+    try:
+        num = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("번호를 입력해주세요.")
+        return
+    if delete_schedule_by_number(uid, num):
+        await update.message.reply_text(f"✅ {num}번 알림 삭제 완료!")
+    else:
+        await update.message.reply_text(f"❌ {num}번 알림을 찾을 수 없어요.")
 
 async def cmd_files(update, context):
     uid = update.effective_user.id
@@ -859,6 +1154,11 @@ async def cmd_help(update, context):
         "📬 메일: /mail, '받은 메일 보여줘'\n"
         "🎙️ 음성: 음성/m4a 파일 보내면 자동 분석\n"
         "📝 메모: /memo [내용], /memos\n"
+        "🗑️ 메모삭제: /memodel [번호], /memoclear\n"
+        "🎬 유튜브: '쇼츠 대본 써줘 주제: ○○'\n"
+        "⏰ 알림: '내일 10시에 운동가라고 알려줘'\n"
+        "📅 알림목록: /schedules\n"
+        "❌ 알림삭제: /scheduledel [번호]\n"
         "📰 뉴스: /news 키워드1, 키워드2\n"
         "🔄 반복: '다시 보내줘'\n\n"
         "/clear - 초기화")
@@ -904,11 +1204,28 @@ async def cmd_newsdel(update, context):
     else:
         await update.message.reply_text(f"❌ '{keyword}' 키워드를 찾을 수 없어요.")
 
+async def _search_one_keyword(kw):
+    try:
+        r = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 1}],
+            messages=[{"role": "user", "content":
+                f"'{kw}' 관련 오늘 또는 최근 뉴스 1건을 검색해서 아래 형식으로만 답해줘:\n"
+                f"📅 날짜\n제목\n📌 출처: [매체명](URL)\n→ 한줄 요약\n\n"
+                f"형식 외 다른 말은 하지 말 것."
+            }],
+        )
+        text_parts = [b.text for b in r.content if b.type == "text"]
+        return kw, "\n".join(text_parts) if text_parts else "검색 결과 없음"
+    except Exception as e:
+        logger.error(f"News search error for '{kw}': {e}")
+        return kw, "검색 실패"
+
 async def send_news_briefing(app):
     if not ALLOWED_USER_IDS or not DATABASE_URL:
         return
-    today = datetime.now().strftime("%Y.%m.%d")
-    # user_id별 키워드 그룹화
+    today = kst_now().strftime("%Y.%m.%d")
     all_rows = get_news_keywords()
     user_keywords = defaultdict(list)
     for user_id, keyword in all_rows:
@@ -919,27 +1236,10 @@ async def send_news_briefing(app):
         if not keywords:
             continue
         try:
+            results = await asyncio.gather(*[_search_one_keyword(kw) for kw in keywords])
             briefing = f"📰 오늘의 뉴스 브리핑 ({today})\n"
-            for kw in keywords:
-                briefing += f"\n🔍 [{kw}]\n"
-                try:
-                    r = await client.messages.create(
-                        model="claude-sonnet-4-6",
-                        max_tokens=512,
-                        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 1}],
-                        messages=[{"role": "user", "content":
-                            f"'{kw}' 관련 오늘 또는 최근 뉴스 1건을 검색해서 아래 형식으로만 답해줘:\n"
-                            f"📅 날짜\n제목\n📌 출처: [매체명](URL)\n→ 한줄 요약\n\n"
-                            f"형식 외 다른 말은 하지 말 것."
-                        }],
-                    )
-                    text_parts = [b.text for b in r.content if b.type == "text"]
-                    briefing += "\n".join(text_parts) if text_parts else "검색 결과 없음"
-                except Exception as e:
-                    logger.error(f"News search error for '{kw}': {e}")
-                    briefing += "검색 실패"
-                briefing += "\n"
-
+            for kw, result in results:
+                briefing += f"\n🔍 [{kw}]\n{result}\n"
             for i in range(0, len(briefing), 4096):
                 await app.bot.send_message(chat_id=uid, text=briefing[i:i+4096])
         except Exception as e:
@@ -961,7 +1261,8 @@ async def handle_voice(update, context):
         await update.message.reply_text("❌ 파일 다운로드 실패")
         return
     loop = asyncio.get_running_loop()
-    txt = await loop.run_in_executor(None, transcribe_audio, bytes(data), voice.mime_type or "audio/ogg")
+    # 일반 음성 메시지: 단일 화자 → diarization 비활성화
+    txt = await loop.run_in_executor(None, transcribe_audio, bytes(data), voice.mime_type or "audio/ogg", False)
     if txt:
         transcript = f"📝 텍스트:\n\n{txt}"
         for i in range(0, len(transcript), 4096):
@@ -989,7 +1290,8 @@ async def handle_audio_file(update, context):
         await update.message.reply_text("❌ 파일 다운로드 실패")
         return
     loop = asyncio.get_running_loop()
-    txt = await loop.run_in_executor(None, transcribe_audio, bytes(data), audio.mime_type or "audio/mpeg")
+    # 파일 업로드 음성: 통화 녹음 가능성 → diarization 활성화
+    txt = await loop.run_in_executor(None, transcribe_audio, bytes(data), audio.mime_type or "audio/mpeg", True)
     if txt:
         if len(txt) > 3000:
             for i in range(0, len(txt), 3000):
@@ -1029,7 +1331,8 @@ async def handle_photo(update, context):
             await update.message.reply_text("❌ 이미지 다운로드 실패")
             return
 
-        user_last_photo[u.id] = {"b64": b64, "mime_type": mime_type}
+        # TTL과 함께 저장 (메모리 누수 방지)
+        user_last_photo[u.id] = {"b64": b64, "mime_type": mime_type, "ts": datetime.utcnow()}
 
         caption = (update.message.caption or "").strip()
         if caption:
@@ -1040,7 +1343,7 @@ async def handle_photo(update, context):
         else:
             await update.message.reply_text(
                 "📸 이미지 수신 완료! 분석 방법을 말씀해주세요.\n"
-                "예: 디자인 피드백, 인스타 캡션, 마케팅 분석"
+                "예: 디자인 피드백, 인스타 캡션, 마케팅 분석, 유튜브 쇼츠 대본"
             )
 
     except Exception as e:
@@ -1054,6 +1357,12 @@ async def handle_message(update, context):
         return
 
     text = update.message.text or ""
+
+    # 10분 초과 사진 TTL 정리
+    if u.id in user_last_photo:
+        age = (datetime.utcnow() - user_last_photo[u.id]["ts"]).total_seconds()
+        if age > 600:
+            user_last_photo.pop(u.id)
 
     # 이전에 받은 이미지 + 분석 키워드 감지 → vision 호출
     if u.id in user_last_photo and any(kw in text for kw in ANALYSIS_KEYWORDS):
@@ -1140,7 +1449,8 @@ async def handle_message(update, context):
 
     elif "[EMAIL_WITH_FILE:" in resp:
         try:
-            parts = resp.split("[EMAIL_WITH_FILE:")[1].split("]")[0].split("|")
+            # maxsplit=3 으로 본문 내 | 포함 허용
+            parts = resp.split("[EMAIL_WITH_FILE:")[1].split("]")[0].split("|", 3)
             to_addr, subject, body, fnum = parts[0], parts[1], parts[2], int(parts[3]) - 1
             files = user_search_results.get(u.id, [])
             if 0 <= fnum < len(files):
@@ -1164,7 +1474,8 @@ async def handle_message(update, context):
 
     elif "[EMAIL:" in resp:
         try:
-            parts = resp.split("[EMAIL:")[1].split("]")[0].split("|")
+            # maxsplit=2 으로 본문 내 | 포함 허용
+            parts = resp.split("[EMAIL:")[1].split("]")[0].split("|", 2)
             to_addr, subject, body = parts[0], parts[1], parts[2]
             await update.message.reply_text(f"📧 {to_addr}로 전송 중...")
             ok, msg = send_gmail(to_addr, subject, body)
@@ -1224,6 +1535,43 @@ async def handle_message(update, context):
             logger.error(f"Gmail read error: {e}")
             await update.message.reply_text("❌ 번호 확인 필요")
 
+    elif "[MEMO_DELETE_ALL]" in resp:
+        count = delete_all_memos(u.id)
+        if count > 0:
+            await update.message.reply_text(f"✅ 메모 {count}개 전체 삭제 완료!")
+        else:
+            await update.message.reply_text("삭제할 메모가 없어요.")
+
+    elif "[MEMO_DELETE:" in resp:
+        try:
+            num = int(resp.split("[MEMO_DELETE:")[1].split("]")[0])
+            if delete_memo_by_number(u.id, num):
+                await update.message.reply_text(f"✅ {num}번 메모 삭제 완료!")
+            else:
+                await update.message.reply_text(f"❌ {num}번 메모를 찾을 수 없어요.")
+        except Exception as e:
+            logger.error(f"Memo delete error: {e}")
+            await update.message.reply_text("❌ 메모 삭제 실패")
+
+    elif "[SCHEDULE:" in resp:
+        try:
+            inner = resp.split("[SCHEDULE:")[1].split("]")[0]
+            dt_str, msg_content = inner.split("|", 1)
+            scheduled_at = datetime.strptime(dt_str.strip(), "%Y-%m-%d %H:%M")
+            if scheduled_at <= kst_now():
+                await update.message.reply_text("⚠️ 이미 지난 시간이에요. 다시 설정해주세요.")
+            elif save_schedule(u.id, msg_content.strip(), scheduled_at):
+                await update.message.reply_text(
+                    f"⏰ 알림 설정 완료!\n\n"
+                    f"📅 {scheduled_at.strftime('%Y.%m.%d %H:%M')}\n"
+                    f"📝 {msg_content.strip()}"
+                )
+            else:
+                await update.message.reply_text("❌ 알림 저장 실패")
+        except Exception as e:
+            logger.error(f"Schedule error: {e}")
+            await update.message.reply_text("❌ 알림 설정 실패. 날짜 형식을 확인해주세요.")
+
     else:
         if len(resp) > 4096:
             for i in range(0, len(resp), 4096):
@@ -1239,6 +1587,10 @@ def main():
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("memo", cmd_memo))
     app.add_handler(CommandHandler("memos", cmd_memos))
+    app.add_handler(CommandHandler("memodel", cmd_memodel))
+    app.add_handler(CommandHandler("memoclear", cmd_memoclear))
+    app.add_handler(CommandHandler("schedules", cmd_schedules))
+    app.add_handler(CommandHandler("scheduledel", cmd_scheduledel))
     app.add_handler(CommandHandler("files", cmd_files))
     app.add_handler(CommandHandler("mail", cmd_mail))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -1262,11 +1614,12 @@ def main():
     print(f"Total handlers: {len(app.handlers[0])}", flush=True)
 
     scheduler = AsyncIOScheduler()
+    scheduler.add_job(check_schedules, "interval", minutes=1, args=[app])
     scheduler.add_job(check_new_gmail, "interval", minutes=60, args=[app])
     scheduler.add_job(send_news_briefing, "cron", hour=1, minute=0, args=[app])  # 01:00 UTC = 10:00 KST
     scheduler.start()
 
-    logger.info("Bot started! (Drive + Gmail + Speech + Web Search + DB + Mail Alert)")
+    logger.info("Bot started! (Drive + Gmail + Speech + Web Search + DB + Mail Alert + Schedules)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
