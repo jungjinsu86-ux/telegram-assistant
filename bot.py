@@ -74,6 +74,14 @@ def init_db():
                 notified_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS news_keywords (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                keyword TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
         cur.execute("DELETE FROM notified_mail_ids WHERE notified_at < NOW() - INTERVAL '7 days'")
         conn.commit()
         cur.close()
@@ -118,6 +126,59 @@ def get_memos_for_prompt(user_id):
     for content, created_at in memos:
         text += f"- {content} ({created_at.strftime('%m/%d')})\n"
     return text
+
+def save_news_keywords(user_id, keywords):
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        for kw in keywords:
+            kw = kw.strip()
+            if kw:
+                cur.execute(
+                    "INSERT INTO news_keywords (user_id, keyword) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    (user_id, kw)
+                )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"News keyword save error: {e}")
+
+def get_news_keywords(user_id=None):
+    if not DATABASE_URL:
+        return []
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        if user_id:
+            cur.execute("SELECT id, keyword FROM news_keywords WHERE user_id=%s ORDER BY created_at", (user_id,))
+        else:
+            cur.execute("SELECT DISTINCT user_id, keyword FROM news_keywords ORDER BY user_id")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"News keyword get error: {e}")
+        return []
+
+def delete_news_keyword(user_id, keyword):
+    if not DATABASE_URL:
+        return False
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM news_keywords WHERE user_id=%s AND keyword=%s", (user_id, keyword))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        conn.close()
+        return deleted
+    except Exception as e:
+        logger.error(f"News keyword delete error: {e}")
+        return False
 
 # ── Google Drive
 drive_service = None
@@ -774,8 +835,91 @@ async def cmd_help(update, context):
         "📬 메일: /mail, '받은 메일 보여줘'\n"
         "🎙️ 음성: 음성/m4a 파일 보내면 자동 분석\n"
         "📝 메모: /memo [내용], /memos\n"
+        "📰 뉴스: /뉴스 키워드1, 키워드2\n"
         "🔄 반복: '다시 보내줘'\n\n"
         "/clear - 초기화")
+
+async def cmd_뉴스(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid): return
+    if not DATABASE_URL:
+        await update.message.reply_text("❌ DB 미연결")
+        return
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("사용법: /뉴스 키워드1, 키워드2, 키워드3")
+        return
+    keywords = [kw.strip() for kw in text.split(",") if kw.strip()]
+    save_news_keywords(uid, keywords)
+    await update.message.reply_text(
+        f"✅ 키워드 저장 완료!\n\n저장된 키워드: {', '.join(keywords)}\n\n매일 오전 10시에 뉴스 브리핑 보내드릴게요."
+    )
+
+async def cmd_뉴스목록(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid): return
+    rows = get_news_keywords(uid)
+    if not rows:
+        await update.message.reply_text("저장된 키워드 없음\n\n/뉴스 키워드1, 키워드2 로 추가하세요.")
+        return
+    msg = "📰 저장된 뉴스 키워드:\n\n"
+    for i, (_, kw) in enumerate(rows, 1):
+        msg += f"{i}. {kw}\n"
+    await update.message.reply_text(msg)
+
+async def cmd_뉴스삭제(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid): return
+    keyword = " ".join(context.args).strip()
+    if not keyword:
+        await update.message.reply_text("사용법: /뉴스삭제 키워드명")
+        return
+    deleted = delete_news_keyword(uid, keyword)
+    if deleted:
+        await update.message.reply_text(f"✅ '{keyword}' 삭제 완료!")
+    else:
+        await update.message.reply_text(f"❌ '{keyword}' 키워드를 찾을 수 없어요.")
+
+async def send_news_briefing(app):
+    if not ALLOWED_USER_IDS or not DATABASE_URL:
+        return
+    today = datetime.now().strftime("%Y.%m.%d")
+    # user_id별 키워드 그룹화
+    all_rows = get_news_keywords()
+    user_keywords = defaultdict(list)
+    for user_id, keyword in all_rows:
+        user_keywords[user_id].append(keyword)
+
+    for uid in ALLOWED_USER_IDS:
+        keywords = user_keywords.get(uid, [])
+        if not keywords:
+            continue
+        try:
+            briefing = f"📰 오늘의 뉴스 브리핑 ({today})\n"
+            for kw in keywords:
+                briefing += f"\n🔍 [{kw}]\n"
+                try:
+                    r = await client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=512,
+                        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 1}],
+                        messages=[{"role": "user", "content":
+                            f"'{kw}' 관련 오늘 또는 최근 뉴스 1건을 검색해서 아래 형식으로만 답해줘:\n"
+                            f"📅 날짜\n제목\n📌 출처: [매체명](URL)\n→ 한줄 요약\n\n"
+                            f"형식 외 다른 말은 하지 말 것."
+                        }],
+                    )
+                    text_parts = [b.text for b in r.content if b.type == "text"]
+                    briefing += "\n".join(text_parts) if text_parts else "검색 결과 없음"
+                except Exception as e:
+                    logger.error(f"News search error for '{kw}': {e}")
+                    briefing += "검색 실패"
+                briefing += "\n"
+
+            for i in range(0, len(briefing), 4096):
+                await app.bot.send_message(chat_id=uid, text=briefing[i:i+4096])
+        except Exception as e:
+            logger.error(f"News briefing send error for uid {uid}: {e}")
 
 async def handle_voice(update, context):
     u = update.effective_user
@@ -1069,6 +1213,9 @@ def main():
     app.add_handler(CommandHandler("files", cmd_files))
     app.add_handler(CommandHandler("mail", cmd_mail))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("뉴스", cmd_뉴스))
+    app.add_handler(CommandHandler("뉴스목록", cmd_뉴스목록))
+    app.add_handler(CommandHandler("뉴스삭제", cmd_뉴스삭제))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
@@ -1087,6 +1234,7 @@ def main():
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_new_gmail, "interval", minutes=60, args=[app])
+    scheduler.add_job(send_news_briefing, "cron", hour=1, minute=0, args=[app])  # 01:00 UTC = 10:00 KST
     scheduler.start()
 
     logger.info("Bot started! (Drive + Gmail + Speech + Web Search + DB + Mail Alert)")
