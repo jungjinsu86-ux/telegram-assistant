@@ -556,7 +556,7 @@ def _build_mail_msg(emails, start, end, has_more):
     """emails[start:end] 슬라이스를 텔레그램 메시지 문자열로 변환."""
     page = emails[start:end]
     if not page:
-        return None
+        return ""
     msg = f"📬 메일 목록 ({start+1}~{start+len(page)}번):\n\n"
     for i, e in enumerate(page, start + 1):
         sender = e["from"].split("<")[0].strip()[:20]
