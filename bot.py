@@ -772,6 +772,8 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 주소 없을 때: 반드시 먼저 물어보기
 주소 있을 때: 제목/본문이 없어도 문맥에서 추론해서 작성
 파일 첨부: "첨부해서", "붙여서" → [EMAIL_WITH_FILE] 사용
+"[주소] [내용] 메일로 물어봐줘" / "메일로 전달해줘" / "메일로 보내줘" → [EMAIL:주소|제목|본문]
+본문은 자연스럽고 정중한 한국어로 Claude가 직접 작성할 것
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 📬 메일 읽기 규칙
@@ -1652,7 +1654,7 @@ async def handle_message(update, context):
 
     elif "[EMAIL_WITH_FILE:" in resp:
         try:
-            m = re.search(r"\[EMAIL_WITH_FILE:(.*)\]", resp)
+            m = re.search(r"\[EMAIL_WITH_FILE:(.*?)\]", resp, re.DOTALL)
             parts = m.group(1).split("|", 3) if m else []
             to_addr, subject, body, fnum = parts[0], parts[1], parts[2], int(parts[3]) - 1
             files = user_search_results.get(u.id, [])
@@ -1673,23 +1675,23 @@ async def handle_message(update, context):
                 await update.message.reply_text("❌ 잘못된 파일 번호")
         except Exception as e:
             logger.error(f"Email+file error: {e}")
-            await update.message.reply_text("❌ 이메일 전송 실패")
+            await update.message.reply_text(f"❌ 이메일 전송 실패: {e}")
 
     elif "[EMAIL:" in resp:
         try:
-            m = re.search(r"\[EMAIL:(.*)\]", resp)
+            m = re.search(r"\[EMAIL:(.*?)\]", resp, re.DOTALL)
             parts = m.group(1).split("|", 2) if m else []
-            to_addr, subject, body = parts[0], parts[1], parts[2]
+            to_addr, subject, body = parts[0].strip(), parts[1].strip(), parts[2].strip()
             await update.message.reply_text(f"📧 {to_addr}로 전송 중...")
             ok, msg = send_gmail(to_addr, subject, body)
             if ok:
-                await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
+                await update.message.reply_text(f"✅ 메일 전송 완료 ({to_addr})")
                 user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject, "body": body}
             else:
                 await update.message.reply_text(f"❌ 전송 실패: {msg}")
         except Exception as e:
             logger.error(f"Email error: {e}")
-            await update.message.reply_text("❌ 이메일 전송 실패")
+            await update.message.reply_text(f"❌ 이메일 전송 실패: {e}")
 
     elif "[GMAIL_LIST:" in resp:
         query = resp.split("[GMAIL_LIST:")[1].split("]")[0]
