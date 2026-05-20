@@ -998,21 +998,30 @@ def _select_image_prompt(text):
         return IMAGE_SYSTEM_PROMPT, text or "이 디자인을 전문적으로 분석하고 피드백해주세요"
 
 async def _call_vision(b64, mime_type, system_prompt, prompt, update):
-    r = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        system=system_prompt,
-        messages=[{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
-            {"type": "text", "text": prompt},
-        ]}],
-    )
-    result = r.content[0].text if r.content else "분석 결과 없음"
-    if len(result) > 4096:
-        for i in range(0, len(result), 4096):
-            await update.message.reply_text(result[i:i+4096])
-    else:
-        await update.message.reply_text(result)
+    for attempt in range(2):
+        try:
+            r = await client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4096,
+                system=system_prompt,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
+                    {"type": "text", "text": prompt},
+                ]}],
+            )
+            result = r.content[0].text if r.content else "분석 결과 없음"
+            if len(result) > 4096:
+                for i in range(0, len(result), 4096):
+                    await update.message.reply_text(result[i:i+4096])
+            else:
+                await update.message.reply_text(result)
+            return
+        except Exception as e:
+            logger.error(f"Vision error (attempt {attempt + 1}): {e}")
+            if attempt == 0:
+                await asyncio.sleep(2)
+            else:
+                await update.message.reply_text("잠시 서버가 바빠요. 다시 말씀해주시면 바로 답변드릴게요! 🙏")
 
 def is_authorized(uid):
     return not ALLOWED_USER_IDS or uid in ALLOWED_USER_IDS
@@ -1066,19 +1075,23 @@ async def ask_both(question):
 
 async def ask_claude_simple(message):
     """대화 이력 없이 단순 Claude 호출 (both 전용)"""
-    try:
-        r = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2048,
-            system=_CLAUDE_BOTH_SYSTEM,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
-            messages=[{"role": "user", "content": message}],
-        )
-        parts = [b.text for b in r.content if b.type == "text"]
-        return "\n".join(parts) if parts else "응답 없음"
-    except Exception as e:
-        logger.error(f"Claude simple error: {e}")
-        return f"❌ Claude 오류: {e}"
+    for attempt in range(2):
+        try:
+            r = await client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=2048,
+                system=_CLAUDE_BOTH_SYSTEM,
+                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+                messages=[{"role": "user", "content": message}],
+            )
+            parts = [b.text for b in r.content if b.type == "text"]
+            return "\n".join(parts) if parts else "응답 없음"
+        except Exception as e:
+            logger.error(f"Claude simple error (attempt {attempt + 1}): {e}")
+            if attempt == 0:
+                await asyncio.sleep(2)
+            else:
+                return "잠시 서버가 바빠요. 다시 말씀해주시면 바로 답변드릴게요! 🙏"
 
 async def cmd_both(update, context):
     uid = update.effective_user.id
@@ -1102,22 +1115,26 @@ async def ask_claude(user_id, message):
     history.append({"role": "user", "content": f"[현재 KST: {kst_now().strftime('%Y-%m-%d %H:%M')}]\n{message}"})
     if len(history) > MAX_HISTORY:
         history[:] = history[-MAX_HISTORY:]
-    try:
-        r = await client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=4096,
-            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
-            messages=history,
-        )
-        text_parts = [block.text for block in r.content if block.type == "text"]
-        txt = "\n".join(text_parts) if text_parts else "응답 없음"
-        history.append({"role": "assistant", "content": txt})
-        return txt
-    except Exception as e:
-        logger.error(f"Claude error: {e}")
-        if history and history[-1]["role"] == "user":
-            history.pop()
-        return "⚠️ AI 오류. 잠시 후 다시 시도하세요."
+    for attempt in range(2):
+        try:
+            r = await client.messages.create(
+                model="claude-sonnet-4-6", max_tokens=4096,
+                system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+                messages=history,
+            )
+            text_parts = [block.text for block in r.content if block.type == "text"]
+            txt = "\n".join(text_parts) if text_parts else "응답 없음"
+            history.append({"role": "assistant", "content": txt})
+            return txt
+        except Exception as e:
+            logger.error(f"Claude error (attempt {attempt + 1}): {e}")
+            if attempt == 0:
+                await asyncio.sleep(2)
+            else:
+                if history and history[-1]["role"] == "user":
+                    history.pop()
+                return "잠시 서버가 바빠요. 다시 말씀해주시면 바로 답변드릴게요! 🙏"
 
 # ── 알림 체크 (1분마다)
 async def check_schedules(app):
