@@ -1151,7 +1151,7 @@ async def check_new_gmail(app):
     if not gmail_service or not ALLOWED_USER_IDS or not DATABASE_URL:
         return
     try:
-        emails, _ = get_gmail_list(10, "is:unread newer_than:2h")
+        emails, _ = get_gmail_list(10, "newer_than:1h")
         if not emails:
             return
         current_ids = [e["id"] for e in emails]
