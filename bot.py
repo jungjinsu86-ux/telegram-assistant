@@ -1410,6 +1410,12 @@ async def send_news_briefing(app):
         except Exception as e:
             logger.error(f"News briefing send error for uid {uid}: {e}")
 
+async def cmd_briefing(update, context):
+    uid = update.effective_user.id
+    if not is_authorized(uid): return
+    await update.message.reply_text("📰 뉴스 브리핑 시작합니다...")
+    await send_news_briefing(context.application)
+
 async def handle_voice(update, context):
     u = update.effective_user
     if not is_authorized(u.id): return
@@ -1808,6 +1814,7 @@ def main():
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CommandHandler("newslist", cmd_newslist))
     app.add_handler(CommandHandler("newsdel", cmd_newsdel))
+    app.add_handler(CommandHandler("briefing", cmd_briefing))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
