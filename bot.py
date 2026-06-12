@@ -1584,13 +1584,15 @@ async def handle_message(update, context):
             await update.message.reply_text(result[i:i+4096])
         return
 
-    # ── "N번 읽어줘/보여줘" → 최근 메일 목록의 N번째 메일 내용 바로 열기
+    # ── "N번 읽어줘/보여줘" 또는 그냥 "N번" → 최근 메일 목록의 N번째 메일 내용 바로 열기
     _num_m = re.search(r"(\d+)\s*번", text)
     _read_intent = any(w in text for w in ["읽", "열", "보여", "내용", "봐"])
+    _bare_num = re.fullmatch(r"\s*\d+\s*(번|번째)?\s*", text) is not None
     _other_list = any(w in text for w in ["메모", "저서", "파일", "일정", "알림", "스케줄"])
-    if _num_m and _read_intent and not _other_list and user_gmail_list.get(u.id):
+    if (_num_m or _bare_num) and (_read_intent or _bare_num) and not _other_list and user_gmail_list.get(u.id):
         _emails = user_gmail_list.get(u.id, [])
-        idx = int(_num_m.group(1)) - 1
+        _digits = re.search(r"\d+", text)
+        idx = int(_digits.group()) - 1 if _digits else -1
         if 0 <= idx < len(_emails):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
             content = get_gmail_content(_emails[idx]["id"])
