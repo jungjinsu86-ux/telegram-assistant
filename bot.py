@@ -568,6 +568,7 @@ def _fetch_until(uid, need, query):
         if not new_emails:
             break
     user_gmail_list[uid] = emails
+    user_last_list[uid] = 'mail'
     return emails
 
 def _build_mail_msg(emails, start, end, has_more):
@@ -1367,10 +1368,11 @@ async def cmd_files(update, context):
         await update.message.reply_text("📁 파일 없음")
         return
     user_search_results[uid] = files
+    user_last_list[uid] = 'drive'
     msg = "📁 파일 목록:\n\n"
     for i, f in enumerate(files, 1):
-        msg += f"{i}. 📄 {f['name']} ({f.get('modifiedTime','')[:10]})\n"
-    msg += "\n💡 번호로 전송/이메일 첨부 가능!"
+        msg += f"{i}. {_drive_icon(f)} {f['name']} ({f.get('modifiedTime','')[:10]})\n"
+    msg += "\n💡 번호 입력 → 파일은 전송, 폴더는 내용 보기!"
     for i in range(0, len(msg), 4096):
         await update.message.reply_text(msg[i:i+4096])
 
@@ -1387,6 +1389,7 @@ async def cmd_mail(update, context):
         await update.message.reply_text("📭 최근 30일 메일 없음")
         return
     user_gmail_list[uid] = emails
+    user_last_list[uid] = 'mail'
     user_mail_token[uid] = next_token
     user_mail_query_store[uid] = query
     user_mail_offset[uid] = len(emails)
