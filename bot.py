@@ -467,9 +467,10 @@ def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
 
 # ── Gmail read
 def get_gmail_list(max_results=10, query="newer_than:30d", page_token=None):
-    if not gmail_service:
+    if not gmail_service or not gmail_creds:
         return [], None
     try:
+        gmail_creds.refresh(Request())
         params = {"userId": "me", "maxResults": max_results, "q": query}
         if page_token:
             params["pageToken"] = page_token
@@ -573,9 +574,10 @@ def _build_mail_msg(emails, start, end, has_more):
     return msg
 
 def get_gmail_content(msg_id):
-    if not gmail_service:
+    if not gmail_service or not gmail_creds:
         return None
     try:
+        gmail_creds.refresh(Request())
         msg = gmail_service.users().messages().get(
             userId="me", id=msg_id, format="full"
         ).execute()
@@ -666,6 +668,8 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 - 절대로 "저는 Claude AI입니다"라고 밝히지 마세요
 - 절대로 "Drive/Gmail에 접근할 수 없습니다"라고 말하지 마세요
 - 절대로 "봇 서버 담당자에게 확인하세요"라고 하지 마세요
+- 절대로 "이 채널은 실제 봇 서버와 연결이 안 됐다", "여기서는 결과가 안 뜬다", "텔레그램 봇에서 직접 입력하라" 같은 말을 하지 마세요. 당신이 바로 그 텔레그램 봇입니다.
+- 메일/파일 관련 요청에는 변명하지 말고 무조건 아래 명령 형식만 출력하세요
 - [DRIVE_SEARCH:검색어]를 출력하면 시스템이 자동으로 Drive를 검색합니다
 - [EMAIL:주소|제목|본문]을 출력하면 시스템이 자동으로 이메일을 보냅니다
 - 명령 형식을 출력하는 것 자체가 실행입니다
@@ -1578,6 +1582,37 @@ async def handle_message(update, context):
         result = await ask_both(text)
         for i in range(0, len(result), 4096):
             await update.message.reply_text(result[i:i+4096])
+        return
+
+    # ── 메일 확인 요청은 AI 판단 없이 바로 Gmail 조회 (가짜 변명 차단)
+    _t = text.replace(" ", "")
+    _is_send = ("보내" in _t) or ("전송" in _t) or ("@" in text)
+    _is_read_num = bool(re.search(r"\d+\s*번", text)) and any(w in text for w in ["읽", "열", "내용"])
+    _mail_word = ("메일" in _t) or ("이메일" in _t) or ("메일함" in _t)
+    _check_word = any(w in _t for w in [
+        "확인", "보여", "봐줘", "봐봐", "왔", "온거", "온게", "온것", "받은",
+        "체크", "열어", "열려", "못열", "최근", "새메일", "안읽", "목록", "있나", "있어"
+    ])
+    if _mail_word and _check_word and not _is_send and not _is_read_num:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        if ("안읽" in _t) or ("안 읽" in text):
+            query = "is:unread"
+        elif "오늘" in _t:
+            query = "newer_than:1d"
+        else:
+            query = "newer_than:30d"
+        emails, next_token = get_gmail_list(10, query)
+        if emails:
+            user_gmail_list[u.id] = emails
+            user_mail_token[u.id] = next_token
+            user_mail_query_store[u.id] = query
+            user_mail_offset[u.id] = len(emails)
+            has_more = next_token is not None
+            msg = _build_mail_msg(emails, 0, 10, has_more)
+            for i in range(0, len(msg), 4096):
+                await update.message.reply_text(msg[i:i+4096])
+        else:
+            await update.message.reply_text("📭 해당 조건에 맞는 메일이 없어요.")
         return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
