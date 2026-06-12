@@ -436,6 +436,23 @@ def download_drive_file(file_id):
         logger.error(f"Drive download error: {e}")
         return None, None
 
+def list_folder_contents(folder_id, max_results=50):
+    if not drive_service:
+        return []
+    try:
+        q = f"'{folder_id}' in parents and trashed = false"
+        r = drive_service.files().list(q=q, pageSize=max_results,
+            fields="files(id, name, mimeType, modifiedTime)",
+            orderBy="folder, name",
+            supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+        return r.get("files", [])
+    except Exception as e:
+        logger.error(f"Drive folder list error: {e}")
+        return []
+
+def _drive_icon(f):
+    return "📁" if f.get("mimeType") == "application/vnd.google-apps.folder" else "📄"
+
 # ── Gmail send
 def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
     if not gmail_service or not gmail_creds:
@@ -1671,12 +1688,18 @@ async def handle_message(update, context):
         m = re.search(r"\[DRIVE_SEARCH:(.*)\]", resp)
         kw = m.group(1) if m else ""
         files = search_drive_files(kw)
+        if not files:
+            kw_clean = kw.replace("폴더", "").replace("파일", "").strip()
+            if kw_clean and kw_clean != kw:
+                files = search_drive_files(kw_clean)
+                if files:
+                    kw = kw_clean
         if files:
             user_search_results[u.id] = files
             msg = f"🔍 '{kw}' 검색 결과:\n\n"
             for i, f in enumerate(files, 1):
-                msg += f"{i}. 📄 {f['name']} ({f.get('modifiedTime','')[:10]})\n"
-            msg += "\n💡 번호로 전송/이메일 첨부 가능!"
+                msg += f"{i}. {_drive_icon(f)} {f['name']} ({f.get('modifiedTime','')[:10]})\n"
+            msg += "\n💡 번호 입력 → 파일은 전송, 폴더는 내용 보기!"
             for i in range(0, len(msg), 4096):
                 await update.message.reply_text(msg[i:i+4096])
         else:
@@ -1688,7 +1711,7 @@ async def handle_message(update, context):
             user_search_results[u.id] = files
             msg = "📁 파일 목록:\n\n"
             for i, f in enumerate(files, 1):
-                msg += f"{i}. 📄 {f['name']} ({f.get('modifiedTime','')[:10]})\n"
+                msg += f"{i}. {_drive_icon(f)} {f['name']} ({f.get('modifiedTime','')[:10]})\n"
             for i in range(0, len(msg), 4096):
                 await update.message.reply_text(msg[i:i+4096])
         else:
@@ -1700,6 +1723,19 @@ async def handle_message(update, context):
             files = user_search_results.get(u.id, [])
             if 0 <= num < len(files):
                 fi = files[num]
+                if fi.get("mimeType") == "application/vnd.google-apps.folder":
+                    items = list_folder_contents(fi["id"])
+                    if items:
+                        user_search_results[u.id] = items
+                        msg = f"📁 '{fi['name']}' 폴더 내용:\n\n"
+                        for i, f2 in enumerate(items, 1):
+                            msg += f"{i}. {_drive_icon(f2)} {f2['name']} ({f2.get('modifiedTime','')[:10]})\n"
+                        msg += "\n💡 번호 입력 → 파일은 전송, 폴더는 내용 보기!"
+                        for i in range(0, len(msg), 4096):
+                            await update.message.reply_text(msg[i:i+4096])
+                    else:
+                        await update.message.reply_text(f"📁 '{fi['name']}' 폴더가 비어 있어요.")
+                    return
                 await update.message.reply_text(f"📤 '{fi['name']}' 전송 중...")
                 buf, name = download_drive_file(fi["id"])
                 if buf:
