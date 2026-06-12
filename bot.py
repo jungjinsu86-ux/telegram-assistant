@@ -6,7 +6,7 @@ from email.mime.text import MIMEText
 from email import encoders
 from datetime import datetime, timedelta
 from collections import defaultdict
-from telegram import Update
+from telegram import Update, ReactionTypeEmoji
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import anthropic
@@ -1466,6 +1466,14 @@ async def cmd_briefing(update, context):
 async def handle_voice(update, context):
     u = update.effective_user
     if not is_authorized(u.id): return
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            reaction=[ReactionTypeEmoji("👀")],
+        )
+    except Exception:
+        pass
     if not clova_available:
         await update.message.reply_text("❌ 음성 분석 미연결")
         return
@@ -1495,6 +1503,14 @@ async def handle_voice(update, context):
 async def handle_audio_file(update, context):
     u = update.effective_user
     if not is_authorized(u.id): return
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            reaction=[ReactionTypeEmoji("👀")],
+        )
+    except Exception:
+        pass
     if not clova_available:
         await update.message.reply_text("❌ 음성 분석 미연결")
         return
@@ -1529,6 +1545,14 @@ async def handle_photo(update, context):
     if not is_authorized(u.id):
         await update.message.reply_text("Access denied.")
         return
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            reaction=[ReactionTypeEmoji("👀")],
+        )
+    except Exception:
+        pass
 
     try:
         if update.message.photo:
@@ -1574,6 +1598,16 @@ async def handle_message(update, context):
         return
 
     text = update.message.text or ""
+
+    # 👀 메시지 받자마자 '읽고 작업 중' 반응 표시
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            reaction=[ReactionTypeEmoji("👀")],
+        )
+    except Exception:
+        pass
 
     # 10분 초과 사진 TTL 정리
     if u.id in user_last_photo:
