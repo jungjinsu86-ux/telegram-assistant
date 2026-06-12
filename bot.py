@@ -600,16 +600,54 @@ def get_gmail_content(msg_id):
         ).execute()
         headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
         body = _extract_body(msg["payload"])
+        # 공백 정리: 줄 끝 공백 제거 + 3줄 이상 연속 빈 줄은 1줄로 압축
+        body = re.sub(r"[ \t\u00a0]+\n", "\n", body)
+        body = re.sub(r"\n{3,}", "\n\n", body).strip()
         body_preview = body[:1000] + "\n\n...더 있음" if len(body) > 1000 else body
+
+        # 📎 첨부파일 이름 추출 (중첩 parts 재귀 탐색) + 다운로드용 ID 수집
+        attachments = []
+        attachments_meta = []
+        def _walk_parts(part):
+            fn = part.get("filename", "")
+            if fn:
+                pbody = part.get("body", {})
+                size = pbody.get("size", 0)
+                size_str = f" ({size/1024/1024:.1f}MB)" if size >= 1024*1024 else (f" ({size/1024:.0f}KB)" if size > 0 else "")
+                attachments.append(fn + size_str)
+                att_id = pbody.get("attachmentId")
+                if att_id:
+                    attachments_meta.append({"name": fn, "att_id": att_id, "size": size})
+            for p in part.get("parts", []):
+                _walk_parts(p)
+        _walk_parts(msg["payload"])
+
         return {
             "from": headers.get("From", ""),
             "subject": headers.get("Subject", ""),
             "date": headers.get("Date", ""),
             "body": body[:3000],
             "body_preview": body_preview,
+            "attachments": attachments,
+            "attachments_meta": attachments_meta,
         }
     except Exception as e:
         logger.error(f"Gmail read error: {e}")
+        return None
+
+def download_gmail_attachment(msg_id, att_id):
+    if not gmail_service or not gmail_creds:
+        return None
+    try:
+        gmail_creds.refresh(Request())
+        att = gmail_service.users().messages().attachments().get(
+            userId="me", messageId=msg_id, id=att_id).execute()
+        data = base64.urlsafe_b64decode(att["data"])
+        buf = io.BytesIO(data)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        logger.error(f"Gmail attachment error: {e}")
         return None
 
 # ── Speech (CLOVA)
@@ -1051,6 +1089,7 @@ def is_authorized(uid):
 
 user_search_results = defaultdict(list)
 user_gmail_list = defaultdict(list)
+user_mail_attachments = defaultdict(dict)
 user_last_action = defaultdict(dict)
 user_last_photo = {}
 user_mail_offset = {}    # uid -> 다음 표시 시작 인덱스 (0-based)
@@ -1635,6 +1674,39 @@ async def handle_message(update, context):
             await update.message.reply_text(result[i:i+4096])
         return
 
+    # ── "첨부파일 보내줘/다운로드" → 마지막에 연 메일의 첨부파일 전송
+    _tt = text.replace(" ", "")
+    if "첨부" in _tt and any(w in _tt for w in ["보내", "전송", "다운", "받", "줘", "내려"]):
+        info = user_mail_attachments.get(u.id) or {}
+        items = info.get("items", [])
+        if items:
+            _pick = re.search(r"(\d+)\s*번", text)
+            targets = items
+            if _pick:
+                pi = int(_pick.group(1)) - 1
+                if 0 <= pi < len(items):
+                    targets = [items[pi]]
+            sent = 0
+            for it in targets:
+                if it.get("size", 0) > 49 * 1024 * 1024:
+                    await update.message.reply_text(f"⚠️ '{it['name']}'은(는) 50MB를 넘어 텔레그램 전송이 안 돼요.")
+                    continue
+                await update.message.reply_text(f"📎 '{it['name']}' 전송 중...")
+                buf = download_gmail_attachment(info["msg_id"], it["att_id"])
+                if buf:
+                    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
+                    await update.message.reply_document(document=buf, filename=it["name"], caption=f"📎 {it['name']}")
+                    sent += 1
+                else:
+                    await update.message.reply_text(f"❌ '{it['name']}' 다운로드 실패")
+            if sent == 0 and not targets:
+                await update.message.reply_text("❌ 보낼 첨부파일이 없어요.")
+            return
+        elif info:
+            await update.message.reply_text("📭 마지막에 연 메일에는 첨부파일이 없어요.")
+            return
+        # 연 메일이 없으면 아래 일반 흐름으로 진행
+
     # ── "N번 읽어줘/보여줘" 또는 그냥 "N번" → 최근 메일 목록의 N번째 메일 내용 바로 열기
     _num_m = re.search(r"(\d+)\s*번", text)
     _read_intent = any(w in text for w in ["읽", "열", "보여", "내용", "봐"])
@@ -1648,11 +1720,14 @@ async def handle_message(update, context):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
             content = get_gmail_content(_emails[idx]["id"])
             if content:
+                user_mail_attachments[u.id] = {"msg_id": _emails[idx]["id"], "items": content.get("attachments_meta", [])}
                 body_display = content.get("body_preview") or content.get("body", "")[:1000] or "본문 없음"
+                _att = content.get("attachments", [])
+                _att_str = ("\n📎 첨부파일:\n" + "\n".join(f"  • {a}" for a in _att)) if _att else ""
                 msg = (f"📧 메일 내용\n\n"
                        f"👤 {content['from']}\n"
                        f"📌 {content['subject']}\n"
-                       f"📅 {content['date']}\n\n"
+                       f"📅 {content['date']}{_att_str}\n\n"
                        f"📝 내용:\n{body_display}")
                 for i in range(0, len(msg), 4096):
                     await update.message.reply_text(msg[i:i+4096])
@@ -1849,11 +1924,14 @@ async def handle_message(update, context):
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
                 content = get_gmail_content(emails[num]["id"])
                 if content:
+                    user_mail_attachments[u.id] = {"msg_id": emails[num]["id"], "items": content.get("attachments_meta", [])}
                     body_display = content.get("body_preview") or content["body"][:1000] or "본문 없음"
+                    _att = content.get("attachments", [])
+                    _att_str = ("\n📎 첨부파일:\n" + "\n".join(f"  • {a}" for a in _att)) if _att else ""
                     msg = (f"📧 메일 내용\n\n"
                            f"👤 {content['from']}\n"
                            f"📌 {content['subject']}\n"
-                           f"📅 {content['date']}\n\n"
+                           f"📅 {content['date']}{_att_str}\n\n"
                            f"📝 내용:\n{body_display}")
                     if len(msg) > 4096:
                         for i in range(0, len(msg), 4096):
