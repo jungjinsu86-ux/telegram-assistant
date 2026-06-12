@@ -1090,6 +1090,7 @@ def is_authorized(uid):
 user_search_results = defaultdict(list)
 user_gmail_list = defaultdict(list)
 user_mail_attachments = defaultdict(dict)
+user_last_list = defaultdict(str)  # 마지막으로 보여준 목록: 'mail' 또는 'drive'
 user_last_action = defaultdict(dict)
 user_last_photo = {}
 user_mail_offset = {}    # uid -> 다음 표시 시작 인덱스 (0-based)
@@ -1676,7 +1677,8 @@ async def handle_message(update, context):
 
     # ── "첨부파일 보내줘/다운로드" → 마지막에 연 메일의 첨부파일 전송
     _tt = text.replace(" ", "")
-    if "첨부" in _tt and any(w in _tt for w in ["보내", "전송", "다운", "받", "줘", "내려"]):
+    _email_send_intent = ("@" in text) or ("이메일로" in _tt) or ("메일로" in _tt) or bool(re.search(r"(한테|에게)", text))
+    if "첨부" in _tt and any(w in _tt for w in ["보내", "전송", "다운", "받", "줘", "내려"]) and not _email_send_intent:
         info = user_mail_attachments.get(u.id) or {}
         items = info.get("items", [])
         if items:
@@ -1712,7 +1714,8 @@ async def handle_message(update, context):
     _read_intent = any(w in text for w in ["읽", "열", "보여", "내용", "봐"])
     _bare_num = re.fullmatch(r"\s*\d+\s*(번|번째)?\s*", text) is not None
     _other_list = any(w in text for w in ["메모", "저서", "파일", "일정", "알림", "스케줄"])
-    if (_num_m or _bare_num) and (_read_intent or _bare_num) and not _other_list and user_gmail_list.get(u.id):
+    _mail_ctx = (user_last_list.get(u.id) == 'mail') or ('메일' in text)
+    if (_num_m or _bare_num) and (_read_intent or _bare_num) and not _other_list and _mail_ctx and user_gmail_list.get(u.id):
         _emails = user_gmail_list.get(u.id, [])
         _digits = re.search(r"\d+", text)
         idx = int(_digits.group()) - 1 if _digits else -1
@@ -1757,6 +1760,7 @@ async def handle_message(update, context):
         emails, next_token = get_gmail_list(10, query)
         if emails:
             user_gmail_list[u.id] = emails
+            user_last_list[u.id] = 'mail'
             user_mail_token[u.id] = next_token
             user_mail_query_store[u.id] = query
             user_mail_offset[u.id] = len(emails)
@@ -1805,6 +1809,7 @@ async def handle_message(update, context):
                     kw = kw_clean
         if files:
             user_search_results[u.id] = files
+            user_last_list[u.id] = 'drive'
             msg = f"🔍 '{kw}' 검색 결과:\n\n"
             for i, f in enumerate(files, 1):
                 msg += f"{i}. {_drive_icon(f)} {f['name']} ({f.get('modifiedTime','')[:10]})\n"
@@ -1818,6 +1823,7 @@ async def handle_message(update, context):
         files = list_drive_files()
         if files:
             user_search_results[u.id] = files
+            user_last_list[u.id] = 'drive'
             msg = "📁 파일 목록:\n\n"
             for i, f in enumerate(files, 1):
                 msg += f"{i}. {_drive_icon(f)} {f['name']} ({f.get('modifiedTime','')[:10]})\n"
@@ -1836,6 +1842,7 @@ async def handle_message(update, context):
                     items = list_folder_contents(fi["id"])
                     if items:
                         user_search_results[u.id] = items
+                        user_last_list[u.id] = 'drive'
                         msg = f"📁 '{fi['name']}' 폴더 내용:\n\n"
                         for i, f2 in enumerate(items, 1):
                             msg += f"{i}. {_drive_icon(f2)} {f2['name']} ({f2.get('modifiedTime','')[:10]})\n"
@@ -1906,6 +1913,7 @@ async def handle_message(update, context):
         emails, next_token = get_gmail_list(10, query)
         if emails:
             user_gmail_list[u.id] = emails
+            user_last_list[u.id] = 'mail'
             user_mail_token[u.id] = next_token
             user_mail_query_store[u.id] = query
             user_mail_offset[u.id] = len(emails)
