@@ -1584,6 +1584,31 @@ async def handle_message(update, context):
             await update.message.reply_text(result[i:i+4096])
         return
 
+    # ── "N번 읽어줘/보여줘" → 최근 메일 목록의 N번째 메일 내용 바로 열기
+    _num_m = re.search(r"(\d+)\s*번", text)
+    _read_intent = any(w in text for w in ["읽", "열", "보여", "내용", "봐"])
+    _other_list = any(w in text for w in ["메모", "저서", "파일", "일정", "알림", "스케줄"])
+    if _num_m and _read_intent and not _other_list and user_gmail_list.get(u.id):
+        _emails = user_gmail_list.get(u.id, [])
+        idx = int(_num_m.group(1)) - 1
+        if 0 <= idx < len(_emails):
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+            content = get_gmail_content(_emails[idx]["id"])
+            if content:
+                body_display = content.get("body_preview") or content.get("body", "")[:1000] or "본문 없음"
+                msg = (f"📧 메일 내용\n\n"
+                       f"👤 {content['from']}\n"
+                       f"📌 {content['subject']}\n"
+                       f"📅 {content['date']}\n\n"
+                       f"📝 내용:\n{body_display}")
+                for i in range(0, len(msg), 4096):
+                    await update.message.reply_text(msg[i:i+4096])
+            else:
+                await update.message.reply_text("❌ 메일을 여는 데 실패했어요. 다시 시도해주세요.")
+        else:
+            await update.message.reply_text(f"❌ 목록에 {idx+1}번이 없어요. 메일 목록 번호(1~{len(_emails)})를 확인해주세요.")
+        return
+
     # ── 메일 확인 요청은 AI 판단 없이 바로 Gmail 조회 (가짜 변명 차단)
     _t = text.replace(" ", "")
     _is_send = ("보내" in _t) or ("전송" in _t) or ("@" in text)
