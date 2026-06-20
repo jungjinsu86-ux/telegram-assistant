@@ -1092,6 +1092,7 @@ user_search_results = defaultdict(list)
 user_gmail_list = defaultdict(list)
 user_mail_attachments = defaultdict(dict)
 user_last_list = defaultdict(str)  # 마지막으로 보여준 목록: 'mail' 또는 'drive'
+user_last_mail = defaultdict(dict)  # 마지막으로 연 메일 (답장용)
 user_last_action = defaultdict(dict)
 user_last_photo = {}
 user_mail_offset = {}    # uid -> 다음 표시 시작 인덱스 (0-based)
@@ -1681,7 +1682,7 @@ async def handle_message(update, context):
     # ── "첨부파일 보내줘/다운로드" → 마지막에 연 메일의 첨부파일 전송
     _tt = text.replace(" ", "")
     _email_send_intent = ("@" in text) or ("이메일로" in _tt) or ("메일로" in _tt) or bool(re.search(r"(한테|에게)", text))
-    if "첨부" in _tt and any(w in _tt for w in ["보내", "전송", "다운", "받", "줘", "내려"]) and not _email_send_intent:
+    if any(k in _tt for k in ["첨부", "파일", "첨부파일"]) and any(w in _tt for w in ["보내", "전송", "다운", "받", "줘", "내려", "달라", "줄래", "주라", "쏴", "보내줘", "전달", "넘겨", "가져", "다운로드", "내려받", "받을래", "받고싶"]) and not _email_send_intent:
         info = user_mail_attachments.get(u.id) or {}
         items = info.get("items", [])
         if items:
@@ -1712,6 +1713,58 @@ async def handle_message(update, context):
             return
         # 연 메일이 없으면 아래 일반 흐름으로 진행
 
+    # ── "여기에 답장 / N번 메일에 답장" → 해당 메일에 답장 초안 작성 (보내기 전 확인)
+    _tt0 = text.replace(" ", "")
+    if any(w in _tt0 for w in ["답장", "회신", "답메일", "답장써", "답장해", "답장해줘", "답장보내", "답해", "답해줘", "답글", "리플", "답신", "리턴메일", "답장좀", "회신해", "회신써", "답변보내", "답변써", "여기답장", "이거답장", "답장작성"]):
+        # 답장 대상 메일 정하기: "N번"이 있으면 그 메일을 먼저 열고, 없으면 마지막에 연 메일
+        target = None
+        _rnum = re.search(r"(\d+)\s*번", text)
+        if _rnum:
+            _em = user_gmail_list.get(u.id, [])
+            ridx = int(_rnum.group(1)) - 1
+            if 0 <= ridx < len(_em):
+                c = get_gmail_content(_em[ridx]["id"])
+                if c:
+                    target = {"from": c.get("from",""), "subject": c.get("subject",""), "body": c.get("body","")}
+        if not target:
+            target = user_last_mail.get(u.id) or None
+
+        if not target:
+            await update.message.reply_text("어떤 메일에 답장할지 모르겠어요. 먼저 메일을 열거나 \"3번 메일에 답장\"처럼 번호를 알려주세요.")
+            return
+
+        # 보낸 사람 주소 추출
+        addr_m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", target.get("from",""))
+        if not addr_m:
+            await update.message.reply_text("이 메일에서 보낸 사람 주소를 못 찾았어요. 답장 주소를 직접 알려주세요.")
+            return
+        to_addr = addr_m.group(0)
+        subj = target.get("subject","")
+        re_subj = subj if subj.lower().startswith("re:") else f"Re: {subj}"
+
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        draft = await ask_claude(u.id,
+            f"아래 메일에 대한 정중한 한국어 답장 본문만 작성해줘. 인사말과 맺음말 포함, 군더더기 설명 없이 본문만.\n\n"
+            f"[받은 메일 제목] {subj}\n[받은 메일 내용]\n{target.get('body','')[:1500]}")
+        draft = re.sub(r"\[[A-Z_]+:.*?\]", "", draft).strip()
+
+        user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": re_subj, "body": draft}
+        preview = (f"✍️ 답장 초안이에요 (아직 안 보냈어요)\n\n"
+                   f"받는 사람: {to_addr}\n제목: {re_subj}\n\n{draft}\n\n"
+                   f"━━━━━━━━━\n보내려면 \"보내줘\", 고치려면 어떻게 고칠지 말씀해주세요.")
+        for i in range(0, len(preview), 4096):
+            await update.message.reply_text(preview[i:i+4096])
+        return
+
+    # ── "보내줘" (직전 답장 초안 발송)
+    if user_last_action.get(u.id, {}).get("type") == "email" and re.fullmatch(r"\s*(보내|보내줘|보내라|보내자|발송|발송해|전송|전송해|응\s*보내|그래\s*보내|ㅇㅋ\s*보내|네\s*보내|보내도\s*돼|보내도돼|고고|ㄱㄱ|오케이|ok|okay|예스|좋아\s*보내|이대로\s*보내|그대로\s*보내|발송해줘|전송해줘|쏴|쏴줘|보내주세요|보내십시오)\s*", text, re.IGNORECASE):
+        la = user_last_action[u.id]
+        await update.message.reply_text(f"📧 {la['to']}로 보내는 중...")
+        ok, msg = send_gmail(la["to"], la["subject"], la["body"])
+        await update.message.reply_text(f"✅ 답장 보냈어요! ({la['to']})" if ok else f"❌ 전송 실패: {msg}")
+        user_last_action[u.id] = {}
+        return
+
     # ── "N번 읽어줘/보여줘" 또는 그냥 "N번" → 최근 메일 목록의 N번째 메일 내용 바로 열기
     _num_m = re.search(r"(\d+)\s*번", text)
     _read_intent = any(w in text for w in ["읽", "열", "보여", "내용", "봐"])
@@ -1727,6 +1780,7 @@ async def handle_message(update, context):
             content = get_gmail_content(_emails[idx]["id"])
             if content:
                 user_mail_attachments[u.id] = {"msg_id": _emails[idx]["id"], "items": content.get("attachments_meta", [])}
+                user_last_mail[u.id] = {"from": content.get("from",""), "subject": content.get("subject",""), "body": content.get("body","")}
                 body_display = content.get("body_preview") or content.get("body", "")[:1000] or "본문 없음"
                 _att = content.get("attachments", [])
                 _att_str = ("\n📎 첨부파일:\n" + "\n".join(f"  • {a}" for a in _att)) if _att else ""
@@ -1749,8 +1803,10 @@ async def handle_message(update, context):
     _is_read_num = bool(re.search(r"\d+\s*번", text)) and any(w in text for w in ["읽", "열", "내용"])
     _mail_word = ("메일" in _t) or ("이메일" in _t) or ("메일함" in _t)
     _check_word = any(w in _t for w in [
-        "확인", "보여", "봐줘", "봐봐", "왔", "온거", "온게", "온것", "받은",
-        "체크", "열어", "열려", "못열", "최근", "새메일", "안읽", "목록", "있나", "있어"
+        "확인", "보여", "봐줘", "봐봐", "봐", "보자", "왔", "온거", "온게", "온것", "온건",
+        "받은", "체크", "열어", "열려", "못열", "최근", "새메일", "새로운", "안읽", "안 읽",
+        "목록", "리스트", "있나", "있어", "있는지", "왔나", "왔어", "왔는지", "뭐와", "뭐왔",
+        "도착", "확인해", "확인좀", "보여줘", "조회", "읽을거", "읽을것"
     ])
     if _mail_word and _check_word and not _is_send and not _is_read_num:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -1936,6 +1992,7 @@ async def handle_message(update, context):
                 content = get_gmail_content(emails[num]["id"])
                 if content:
                     user_mail_attachments[u.id] = {"msg_id": emails[num]["id"], "items": content.get("attachments_meta", [])}
+                    user_last_mail[u.id] = {"from": content.get("from",""), "subject": content.get("subject",""), "body": content.get("body","")}
                     body_display = content.get("body_preview") or content["body"][:1000] or "본문 없음"
                     _att = content.get("attachments", [])
                     _att_str = ("\n📎 첨부파일:\n" + "\n".join(f"  • {a}" for a in _att)) if _att else ""
