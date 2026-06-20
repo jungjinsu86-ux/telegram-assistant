@@ -1705,7 +1705,7 @@ async def handle_message(update, context):
                     sent += 1
                 else:
                     await update.message.reply_text(f"❌ '{it['name']}' 다운로드 실패")
-            if sent == 0 and not targets:
+            if sent == 0:
                 await update.message.reply_text("❌ 보낼 첨부파일이 없어요.")
             return
         elif info:
@@ -1929,6 +1929,9 @@ async def handle_message(update, context):
         try:
             m = re.search(r"\[EMAIL_WITH_FILE:(.*?)\]", resp, re.DOTALL)
             parts = m.group(1).split("|", 3) if m else []
+            if len(parts) < 4:
+                await update.message.reply_text("❌ 이메일+첨부 형식 오류")
+                return
             to_addr, subject, body, fnum = parts[0], parts[1], parts[2], int(parts[3]) - 1
             files = user_search_results.get(u.id, [])
             if 0 <= fnum < len(files):
@@ -1954,6 +1957,9 @@ async def handle_message(update, context):
         try:
             m = re.search(r"\[EMAIL:(.*?)\]", resp, re.DOTALL)
             parts = m.group(1).split("|", 2) if m else []
+            if len(parts) < 3:
+                await update.message.reply_text("❌ 이메일 형식 오류")
+                return
             to_addr, subject, body = parts[0].strip(), parts[1].strip(), parts[2].strip()
             await update.message.reply_text(f"📧 {to_addr}로 전송 중...")
             ok, msg = send_gmail(to_addr, subject, body)
