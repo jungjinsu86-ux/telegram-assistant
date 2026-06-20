@@ -1085,6 +1085,44 @@ async def _call_vision(b64, mime_type, system_prompt, prompt, update):
             else:
                 await update.message.reply_text("잠시 서버가 바빠요. 다시 말씀해주시면 바로 답변드릴게요! 🙏")
 
+async def extract_calendar_events(b64, mime_type):
+    """캘린더 캡처 이미지에서 일정 목록을 JSON으로 추출."""
+    today = kst_now().strftime("%Y-%m-%d")
+    sysmsg = (
+        "너는 캘린더/달력 캡처 이미지에서 일정을 정확히 읽어내는 도우미야. "
+        f"오늘은 {today}(KST)야. 이미지에 보이는 모든 일정을 빠짐없이 추출해. "
+        "반드시 아래 JSON 배열 형식으로만 답하고, 다른 말/설명/마크다운은 절대 쓰지 마.\n"
+        '[{"date":"YYYY-MM-DD","time":"HH:MM","title":"일정내용"}, ...]\n'
+        "규칙: 날짜는 이미지의 연/월을 기준으로 YYYY-MM-DD로. 연도가 안 보이면 올해로. "
+        "시간이 안 적힌 종일 일정은 time을 \"09:00\"으로. 일정이 하나도 없으면 빈 배열 []만 출력."
+    )
+    for attempt in range(2):
+        try:
+            r = await client.messages.create(
+                model="claude-sonnet-4-6", max_tokens=4096, system=sysmsg,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
+                    {"type": "text", "text": "이 캘린더 이미지의 모든 일정을 JSON 배열로 추출해줘."},
+                ]}],
+            )
+            raw = r.content[0].text if r.content else "[]"
+            raw = re.sub(r"```json|```", "", raw).strip()
+            m = re.search(r"\[.*\]", raw, re.DOTALL)
+            data = json.loads(m.group(0) if m else raw)
+            out = []
+            for e in data:
+                d, t, ti = e.get("date",""), e.get("time","09:00"), (e.get("title","") or "").strip()
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d or "") and ti:
+                    if not re.fullmatch(r"\d{2}:\d{2}", t or ""):
+                        t = "09:00"
+                    out.append({"date": d, "time": t, "title": ti})
+            return out
+        except Exception as e:
+            logger.error(f"Calendar extract error (attempt {attempt+1}): {e}")
+            if attempt == 0:
+                await asyncio.sleep(2)
+    return None
+
 def is_authorized(uid):
     return not ALLOWED_USER_IDS or uid in ALLOWED_USER_IDS
 
@@ -1095,6 +1133,7 @@ user_last_list = defaultdict(str)  # 마지막으로 보여준 목록: 'mail' �
 user_last_mail = defaultdict(dict)  # 마지막으로 연 메일 (답장용)
 user_last_action = defaultdict(dict)
 user_last_photo = {}
+user_pending_cal = defaultdict(list)  # 캘린더 캡처에서 뽑은 일정 (저장 대기)
 user_mail_offset = {}    # uid -> 다음 표시 시작 인덱스 (0-based)
 user_mail_token = {}     # uid -> nextPageToken (None이면 마지막 페이지)
 user_mail_query_store = {}  # uid -> 현재 페이지네이션 중인 Gmail 쿼리
@@ -1620,6 +1659,31 @@ async def handle_photo(update, context):
         user_last_photo[u.id] = {"b64": b64, "mime_type": mime_type, "ts": datetime.utcnow()}
 
         caption = (update.message.caption or "").strip()
+        _cap = caption.replace(" ", "")
+        _is_cal = any(w in _cap for w in ["캘린더", "캘랜더", "달력", "일정", "스케줄", "스케쥴", "월간", "이번달", "다음달"])
+        if _is_cal:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+            events = await extract_calendar_events(b64, mime_type)
+            user_last_photo.pop(u.id, None)
+            if events is None:
+                await update.message.reply_text("❌ 이미지를 읽는 데 실패했어요. 좀 더 또렷한 캡처로 다시 보내주세요.")
+                return
+            if not events:
+                await update.message.reply_text("📅 이미지에서 일정을 못 찾았어요. 캘린더 화면이 또렷하게 나오게 다시 캡처해 주세요.")
+                return
+            events.sort(key=lambda e: (e["date"], e["time"]))
+            user_pending_cal[u.id] = events
+            msg = f"📅 캘린더에서 일정 {len(events)}개를 찾았어요. 확인해주세요:\n\n"
+            for i, e in enumerate(events, 1):
+                msg += f"{i}. {e['date']} {e['time']} — {e['title']}\n"
+            msg += ("\n━━━━━━━━━\n"
+                    "이대로 알림 등록하려면 \"저장해줘\",\n"
+                    "특정 항목만 빼려면 \"3번 빼고 저장\",\n"
+                    "다시 찍으려면 새 캡처를 보내주세요.")
+            for i in range(0, len(msg), 4096):
+                await update.message.reply_text(msg[i:i+4096])
+            return
+
         if caption:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
             system_prompt, prompt = _select_image_prompt(caption)
@@ -1678,6 +1742,40 @@ async def handle_message(update, context):
         for i in range(0, len(result), 4096):
             await update.message.reply_text(result[i:i+4096])
         return
+
+    # ── 캘린더 캡처에서 뽑은 일정 저장 대기 중: "저장해줘 / N번 빼고 저장 / 취소"
+    if user_pending_cal.get(u.id):
+        _pc = text.replace(" ", "")
+        if any(w in _pc for w in ["저장", "등록", "추가", "넣어", "좋아", "ㅇㅇ", "ok", "그래", "맞아", "응"]) and not any(w in _pc for w in ["취소", "안해", "하지마", "지워"]):
+            events = user_pending_cal.get(u.id, [])
+            # "N번 빼고" 처리
+            excl = set(int(x) - 1 for x in re.findall(r"(\d+)\s*번", text)) if "빼" in _pc else set()
+            saved, failed = 0, 0
+            for i, e in enumerate(events):
+                if i in excl:
+                    continue
+                try:
+                    dt = datetime.strptime(f"{e['date']} {e['time']}", "%Y-%m-%d %H:%M")
+                    if dt <= kst_now().replace(tzinfo=None):
+                        continue  # 이미 지난 일정은 건너뜀
+                    save_schedule(u.id, e["title"], dt)
+                    saved += 1
+                except Exception as ex:
+                    logger.error(f"Calendar save error: {ex}")
+                    failed += 1
+            user_pending_cal[u.id] = []
+            done = f"✅ 일정 {saved}개를 알림으로 등록했어요!"
+            if excl:
+                done += f" ({len(excl)}개 제외)"
+            if failed:
+                done += f"\n⚠️ {failed}개는 등록 실패했어요."
+            done += "\n\n\"내 알림 보여줘\"로 확인할 수 있어요."
+            await update.message.reply_text(done)
+            return
+        if any(w in _pc for w in ["취소", "안해", "하지마", "그만", "아니"]):
+            user_pending_cal[u.id] = []
+            await update.message.reply_text("알겠어요, 일정 등록을 취소했어요.")
+            return
 
     # ── 알림 목록을 방금 본 직후: "2번 취소/꺼줘/삭제" 같은 짧은 말 처리
     if user_last_list.get(u.id) == 'schedule':
@@ -1832,8 +1930,8 @@ async def handle_message(update, context):
     if _pending.get("type") == "email" and _pending.get("body"):
         _ttp = text.replace(" ", "")
         _send_words = ["보내", "발송", "전송", "쏴", "ㄱㄱ", "고고", "오케이", "ok", "okay", "예스",
-                       "응", "그래", "맞아", "ㅇㅇ", "ㅇㅋ", "네", "좋아", "오키"]
-        _edit_words = ["고쳐", "수정", "바꿔", "짧게", "길게", "정중", "다르게", "추가", "빼", "말투", "다시써", "다시작성", "고쳐줘", "수정해"]
+                       "응", "그래", "맞아", "ㅇㅇ", "ㅇㅋ", "네", "좋아", "오키", "그거"]
+        _edit_words = ["고쳐", "수정", "다시", "바꿔", "짧게", "길게", "정중", "다르게", "추가", "빼", "말투", "다시써"]
         _is_edit = any(w in _ttp for w in _edit_words)
         _is_send = (not _is_edit) and (not any(w in _ttp for w in ["첨부", "파일"])) and (
             re.fullmatch(r"\s*(보내|보내줘|보내라|보내자|발송|발송해|전송|전송해|응\s*보내|그래\s*보내|ㅇㅋ\s*보내|네\s*보내|보내도\s*돼|보내도돼|고고|ㄱㄱ|오케이|ok|okay|예스|좋아\s*보내|이대로\s*보내|그대로\s*보내|발송해줘|전송해줘|쏴|쏴줘|보내주세요|보내십시오|ㅇㅇ|ㅇㅋ|네|응|그래|맞아|좋아|오키)\s*", text, re.IGNORECASE)
@@ -1952,7 +2050,7 @@ async def handle_message(update, context):
         return
 
     if "[DRIVE_SEARCH:" in resp:
-        m = re.search(r"\[DRIVE_SEARCH:(.*?)\]", resp)
+        m = re.search(r"\[DRIVE_SEARCH:(.*)\]", resp)
         kw = m.group(1) if m else ""
         files = search_drive_files(kw)
         if not files:
@@ -2175,7 +2273,7 @@ async def handle_message(update, context):
 
     elif "[SCHEDULE:" in resp:
         try:
-            m = re.search(r"\[SCHEDULE:(.*?)\]", resp)
+            m = re.search(r"\[SCHEDULE:(.*)\]", resp)
             inner = m.group(1) if m else ""
             dt_str, msg_content = inner.split("|", 1)
             scheduled_at = datetime.strptime(dt_str.strip(), "%Y-%m-%d %H:%M")
