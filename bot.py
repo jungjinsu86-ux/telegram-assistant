@@ -1930,8 +1930,8 @@ async def handle_message(update, context):
     if _pending.get("type") == "email" and _pending.get("body"):
         _ttp = text.replace(" ", "")
         _send_words = ["보내", "발송", "전송", "쏴", "ㄱㄱ", "고고", "오케이", "ok", "okay", "예스",
-                       "응", "그래", "맞아", "ㅇㅇ", "ㅇㅋ", "네", "좋아", "오키", "그거"]
-        _edit_words = ["고쳐", "수정", "다시", "바꿔", "짧게", "길게", "정중", "다르게", "추가", "빼", "말투", "다시써"]
+                       "응", "그래", "맞아", "ㅇㅇ", "ㅇㅋ", "네", "좋아", "오키"]
+        _edit_words = ["고쳐", "수정", "바꿔", "짧게", "길게", "정중", "다르게", "추가", "빼", "말투", "다시써", "다시작성", "고쳐줘", "수정해"]
         _is_edit = any(w in _ttp for w in _edit_words)
         _is_send = (not _is_edit) and (not any(w in _ttp for w in ["첨부", "파일"])) and (
             re.fullmatch(r"\s*(보내|보내줘|보내라|보내자|발송|발송해|전송|전송해|응\s*보내|그래\s*보내|ㅇㅋ\s*보내|네\s*보내|보내도\s*돼|보내도돼|고고|ㄱㄱ|오케이|ok|okay|예스|좋아\s*보내|이대로\s*보내|그대로\s*보내|발송해줘|전송해줘|쏴|쏴줘|보내주세요|보내십시오|ㅇㅇ|ㅇㅋ|네|응|그래|맞아|좋아|오키)\s*", text, re.IGNORECASE)
@@ -2050,7 +2050,7 @@ async def handle_message(update, context):
         return
 
     if "[DRIVE_SEARCH:" in resp:
-        m = re.search(r"\[DRIVE_SEARCH:(.*)\]", resp)
+        m = re.search(r"\[DRIVE_SEARCH:(.*?)\]", resp)
         kw = m.group(1) if m else ""
         files = search_drive_files(kw)
         if not files:
@@ -2273,7 +2273,7 @@ async def handle_message(update, context):
 
     elif "[SCHEDULE:" in resp:
         try:
-            m = re.search(r"\[SCHEDULE:(.*)\]", resp)
+            m = re.search(r"\[SCHEDULE:(.*?)\]", resp)
             inner = m.group(1) if m else ""
             dt_str, msg_content = inner.split("|", 1)
             scheduled_at = datetime.strptime(dt_str.strip(), "%Y-%m-%d %H:%M")
