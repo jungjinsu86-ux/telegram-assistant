@@ -1743,10 +1743,20 @@ async def handle_message(update, context):
         re_subj = subj if subj.lower().startswith("re:") else f"Re: {subj}"
 
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        # 사용자가 답장 톤/내용을 함께 지시했으면 반영
+        _extra = re.sub(r"(\d+\s*번|메일|에게|한테|답장(해줘|좀|해|보내|작성|써)?|회신(해|써)?|답신|답글|리플)", "", text).strip()
+        _instr = f"\n[작성 지시] {_extra}" if len(_extra) >= 2 else ""
         draft = await ask_claude(u.id,
-            f"아래 메일에 대한 정중한 한국어 답장 본문만 작성해줘. 인사말과 맺음말 포함, 군더더기 설명 없이 본문만.\n\n"
-            f"[받은 메일 제목] {subj}\n[받은 메일 내용]\n{target.get('body','')[:1500]}")
+            "너는 이메일 답장을 대신 써주는 비서야. 아래 받은 메일에 대한 한국어 답장 '본문'만 작성해. "
+            "절대 되묻거나 설명하지 말고, 정보가 부족하면 부족한 대로 정중하고 자연스러운 답장을 무조건 완성해. "
+            "원문 내용이 짧거나 비어 있으면 '내용이 제대로 전달되지 않은 것 같아 확인을 부탁드린다'는 취지로 정중히 작성해. "
+            "인사말과 맺음말(끝에 '정진수 드림') 포함, 본문만 출력."
+            f"{_instr}\n\n[받은 메일 제목] {subj}\n[받은 메일 보낸사람] {target.get('from','')}\n[받은 메일 내용]\n{target.get('body','') or '(본문 없음)'}"[:1800])
         draft = re.sub(r"\[[A-Z_]+:.*?\]", "", draft).strip()
+        # 혹시라도 AI가 되물음/거부로 응답하면 안전한 기본 문구로 대체
+        if (not draft) or any(b in draft for b in ["알려주", "무엇을", "어떤 내용", "파악이 어렵", "작성해드릴", "필요해요", "필요합니다"]):
+            draft = ("안녕하세요.\n\n보내주신 메일 잘 받았습니다. 다만 내용이 제대로 전달되지 않은 것 같아 확인 차 연락드립니다. "
+                     "전송 중 오류가 있었거나 내용이 누락된 것은 아닌지 확인 부탁드리며, 다시 한번 보내주시면 감사하겠습니다.\n\n감사합니다.\n정진수 드림")
 
         user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": re_subj, "body": draft}
         preview = (f"✍️ 답장 초안이에요 (아직 안 보냈어요)\n\n"
@@ -1756,14 +1766,38 @@ async def handle_message(update, context):
             await update.message.reply_text(preview[i:i+4096])
         return
 
-    # ── "보내줘" (직전 답장 초안 발송)
-    if user_last_action.get(u.id, {}).get("type") == "email" and re.fullmatch(r"\s*(보내|보내줘|보내라|보내자|발송|발송해|전송|전송해|응\s*보내|그래\s*보내|ㅇㅋ\s*보내|네\s*보내|보내도\s*돼|보내도돼|고고|ㄱㄱ|오케이|ok|okay|예스|좋아\s*보내|이대로\s*보내|그대로\s*보내|발송해줘|전송해줘|쏴|쏴줘|보내주세요|보내십시오)\s*", text, re.IGNORECASE):
-        la = user_last_action[u.id]
-        await update.message.reply_text(f"📧 {la['to']}로 보내는 중...")
-        ok, msg = send_gmail(la["to"], la["subject"], la["body"])
-        await update.message.reply_text(f"✅ 답장 보냈어요! ({la['to']})" if ok else f"❌ 전송 실패: {msg}")
-        user_last_action[u.id] = {}
-        return
+    # ── 답장 초안 대기 중일 때: 발송 / 수정 처리 (자연스러운 말도 인식)
+    _pending = user_last_action.get(u.id, {})
+    if _pending.get("type") == "email" and _pending.get("body"):
+        _ttp = text.replace(" ", "")
+        _send_words = ["보내", "발송", "전송", "쏴", "ㄱㄱ", "고고", "오케이", "ok", "okay", "예스",
+                       "응", "그래", "맞아", "ㅇㅇ", "ㅇㅋ", "네", "좋아", "오키", "그거"]
+        _edit_words = ["고쳐", "수정", "다시", "바꿔", "짧게", "길게", "정중", "다르게", "추가", "빼", "말투", "다시써"]
+        _is_edit = any(w in _ttp for w in _edit_words)
+        _is_send = (not _is_edit) and (not any(w in _ttp for w in ["첨부", "파일"])) and (
+            re.fullmatch(r"\s*(보내|보내줘|보내라|보내자|발송|발송해|전송|전송해|응\s*보내|그래\s*보내|ㅇㅋ\s*보내|네\s*보내|보내도\s*돼|보내도돼|고고|ㄱㄱ|오케이|ok|okay|예스|좋아\s*보내|이대로\s*보내|그대로\s*보내|발송해줘|전송해줘|쏴|쏴줘|보내주세요|보내십시오|ㅇㅇ|ㅇㅋ|네|응|그래|맞아|좋아|오키)\s*", text, re.IGNORECASE)
+            or (len(_ttp) <= 15 and any(w in _ttp for w in _send_words))
+        )
+        if _is_send:
+            la = _pending
+            await update.message.reply_text(f"📧 {la['to']}로 보내는 중...")
+            ok, msg = send_gmail(la["to"], la["subject"], la["body"])
+            await update.message.reply_text(f"✅ 답장 보냈어요! ({la['to']})" if ok else f"❌ 전송 실패: {msg}")
+            user_last_action[u.id] = {}
+            return
+        if _is_edit:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+            newdraft = await ask_claude(u.id,
+                "아래 이메일 초안을 사용자의 요청대로 고쳐서, 수정된 '본문'만 출력해. 설명/되묻기 없이 본문만. 끝에 '정진수 드림' 유지.\n\n"
+                f"[사용자 요청] {text}\n\n[기존 초안]\n{_pending['body']}")
+            newdraft = re.sub(r"\[[A-Z_]+:.*?\]", "", newdraft).strip() or _pending["body"]
+            user_last_action[u.id] = {"type": "email", "to": _pending["to"], "subject": _pending["subject"], "body": newdraft}
+            preview = (f"✍️ 수정한 답장 초안이에요 (아직 안 보냈어요)\n\n"
+                       f"받는 사람: {_pending['to']}\n제목: {_pending['subject']}\n\n{newdraft}\n\n"
+                       f"━━━━━━━━━\n보내려면 \"보내줘\", 더 고치려면 어떻게 고칠지 말씀해주세요.")
+            for i in range(0, len(preview), 4096):
+                await update.message.reply_text(preview[i:i+4096])
+            return
 
     # ── "N번 읽어줘/보여줘" 또는 그냥 "N번" → 최근 메일 목록의 N번째 메일 내용 바로 열기
     _num_m = re.search(r"(\d+)\s*번", text)
