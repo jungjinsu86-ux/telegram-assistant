@@ -1679,6 +1679,67 @@ async def handle_message(update, context):
             await update.message.reply_text(result[i:i+4096])
         return
 
+    # ── 알림 목록을 방금 본 직후: "2번 취소/꺼줘/삭제" 같은 짧은 말 처리
+    if user_last_list.get(u.id) == 'schedule':
+        _sm = re.fullmatch(r"\s*(\d+)\s*번?\s*(꺼|꺼줘|끄|끄기|취소|취소해|삭제|삭제해|지워|지워줘|해제|멈춰|제거|없애|빼)\s*", text)
+        if _sm:
+            num = int(_sm.group(1))
+            if delete_schedule_by_number(u.id, num):
+                await update.message.reply_text(f"✅ {num}번 알림을 껐어요.")
+            else:
+                await update.message.reply_text(f"❌ {num}번 알림을 못 찾았어요.")
+            return
+
+    # ── 알림/스케줄 한글 관리 (목록 보기 / 끄기·취소)
+    _ts = text.replace(" ", "")
+    # 알림 '설정' 의도(시간 표현 + 맞춰/설정/잡아 등)는 여기서 처리하지 않고 AI(SCHEDULE)로 넘김
+    _set_intent = any(w in _ts for w in ["맞춰", "맞춥", "설정해", "잡아", "잡아줘", "등록", "추가해", "걸어", "울려"]) \
+        or bool(re.search(r"(\d+\s*(분|시간|일)\s*(후|뒤)|내일|모레|오늘|이따|잠[시깐]|아침|점심|저녁|오전|오후|새벽|\d+\s*시)", text)) and any(w in _ts for w in ["알려", "알람", "알림", "리마인"])
+    _sch_word = any(w in _ts for w in [
+        "알림", "알람", "알려논", "알려둔", "알려놓", "스케줄", "스케쥴", "리마인",
+        "리마인더", "예약", "일정", "할일", "todo", "투두"])
+    if _sch_word and not _set_intent:
+        _del = any(w in _ts for w in [
+            "꺼", "끄", "껐", "취소", "삭제", "지워", "지우", "해제", "없애", "없앤",
+            "빼", "제거", "삭재", "끄기", "꺼줘", "취소해", "지워줘", "삭제해", "그만",
+            "중단", "중지", "멈춰", "멈춤", "안받", "안받을", "필요없"])
+        _list = any(w in _ts for w in [
+            "목록", "리스트", "뭐", "뭔", "보여", "봐", "확인", "있", "알려", "뭣",
+            "어떤", "어떻게", "조회", "내알람", "내알림", "현재", "남은", "예약된",
+            "설정된", "뭐있", "어떤거", "체크", "정리", "전체", "다보여"])
+        if _del:
+            _dn = re.search(r"(\d+)\s*번?", text)
+            scheds = get_user_schedules(u.id)
+            if not scheds:
+                await update.message.reply_text("⏰ 켜져 있는 알림이 없어요.")
+                return
+            if _dn:
+                num = int(_dn.group(1))
+                if delete_schedule_by_number(u.id, num):
+                    await update.message.reply_text(f"✅ {num}번 알림을 껐어요.")
+                else:
+                    await update.message.reply_text(f"❌ {num}번 알림을 못 찾았어요. \"알림 목록\"으로 번호를 확인해주세요.")
+                return
+            # 번호 없이 "알림 꺼줘"만 → 목록 보여주고 번호 안내
+            msg = "⏰ 어떤 알림을 끌까요? 번호로 말씀해주세요 (예: \"2번 알림 꺼줘\")\n\n"
+            for i, (sid, m, at) in enumerate(scheds, 1):
+                msg += f"{i}. {m} — {at.strftime('%m/%d %H:%M')}\n"
+            user_last_list[u.id] = 'schedule'
+            await update.message.reply_text(msg)
+            return
+        if _list:
+            scheds = get_user_schedules(u.id)
+            if not scheds:
+                await update.message.reply_text("⏰ 예약된 알림이 없어요.\n\n예: \"내일 오전 10시에 약 먹으라고 알려줘\"")
+                return
+            msg = "⏰ 예약된 알림 목록:\n\n"
+            for i, (sid, m, at) in enumerate(scheds, 1):
+                msg += f"{i}. {m} — {at.strftime('%m/%d %H:%M')}\n"
+            msg += "\n💡 끄려면 \"3번 알림 꺼줘\" 처럼 말씀하세요."
+            user_last_list[u.id] = 'schedule'
+            await update.message.reply_text(msg)
+            return
+
     # ── "첨부파일 보내줘/다운로드" → 마지막에 연 메일의 첨부파일 전송
     _tt = text.replace(" ", "")
     _email_send_intent = ("@" in text) or ("이메일로" in _tt) or ("메일로" in _tt) or bool(re.search(r"(한테|에게)", text))
@@ -1771,8 +1832,8 @@ async def handle_message(update, context):
     if _pending.get("type") == "email" and _pending.get("body"):
         _ttp = text.replace(" ", "")
         _send_words = ["보내", "발송", "전송", "쏴", "ㄱㄱ", "고고", "오케이", "ok", "okay", "예스",
-                       "응", "그래", "맞아", "ㅇㅇ", "ㅇㅋ", "네", "좋아", "오키"]
-        _edit_words = ["고쳐", "수정", "바꿔", "짧게", "길게", "정중", "다르게", "추가", "빼", "말투", "다시써", "다시작성", "고쳐줘", "수정해"]
+                       "응", "그래", "맞아", "ㅇㅇ", "ㅇㅋ", "네", "좋아", "오키", "그거"]
+        _edit_words = ["고쳐", "수정", "다시", "바꿔", "짧게", "길게", "정중", "다르게", "추가", "빼", "말투", "다시써"]
         _is_edit = any(w in _ttp for w in _edit_words)
         _is_send = (not _is_edit) and (not any(w in _ttp for w in ["첨부", "파일"])) and (
             re.fullmatch(r"\s*(보내|보내줘|보내라|보내자|발송|발송해|전송|전송해|응\s*보내|그래\s*보내|ㅇㅋ\s*보내|네\s*보내|보내도\s*돼|보내도돼|고고|ㄱㄱ|오케이|ok|okay|예스|좋아\s*보내|이대로\s*보내|그대로\s*보내|발송해줘|전송해줘|쏴|쏴줘|보내주세요|보내십시오|ㅇㅇ|ㅇㅋ|네|응|그래|맞아|좋아|오키)\s*", text, re.IGNORECASE)
@@ -1891,7 +1952,7 @@ async def handle_message(update, context):
         return
 
     if "[DRIVE_SEARCH:" in resp:
-        m = re.search(r"\[DRIVE_SEARCH:(.*?)\]", resp)
+        m = re.search(r"\[DRIVE_SEARCH:(.*)\]", resp)
         kw = m.group(1) if m else ""
         files = search_drive_files(kw)
         if not files:
@@ -2114,7 +2175,7 @@ async def handle_message(update, context):
 
     elif "[SCHEDULE:" in resp:
         try:
-            m = re.search(r"\[SCHEDULE:(.*?)\]", resp)
+            m = re.search(r"\[SCHEDULE:(.*)\]", resp)
             inner = m.group(1) if m else ""
             dt_str, msg_content = inner.split("|", 1)
             scheduled_at = datetime.strptime(dt_str.strip(), "%Y-%m-%d %H:%M")
