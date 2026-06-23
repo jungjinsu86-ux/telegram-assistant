@@ -652,7 +652,7 @@ def download_gmail_attachment(msg_id, att_id):
         return None
 
 # ── Speech (CLOVA)
-def transcribe_audio(audio_bytes, mime_type="audio/ogg", enable_diarization=True):
+def transcribe_audio(audio_bytes, mime_type="audio/ogg", enable_diarization=True, max_speakers=6):
     if not clova_available:
         return None
     try:
@@ -664,10 +664,11 @@ def transcribe_audio(audio_bytes, mime_type="audio/ogg", enable_diarization=True
             "language": "ko-KR",
             "completion": "sync",
             "speaker": enable_diarization,
+            # 통화(2명)~회의(최대 max_speakers명)까지 자동 감지
             "diarization": {
                 "enable": enable_diarization,
                 "speakerCountMin": 2,
-                "speakerCountMax": 2,
+                "speakerCountMax": max(2, max_speakers),
             } if enable_diarization else {"enable": False},
         }
         files = {
@@ -1607,16 +1608,29 @@ async def handle_audio_file(update, context):
         await update.message.reply_text("❌ 파일 다운로드 실패")
         return
     loop = asyncio.get_running_loop()
-    # 파일 업로드 음성: 통화 녹음 가능성 → diarization 활성화
-    txt = await loop.run_in_executor(None, transcribe_audio, bytes(data), audio.mime_type or "audio/mpeg", True)
+    # 파일 업로드 음성: 통화/회의 녹음 → diarization 활성화 (최대 6명 화자 분리)
+    txt = await loop.run_in_executor(None, transcribe_audio, bytes(data), audio.mime_type or "audio/mpeg", True, 6)
     if txt:
         if len(txt) > 3000:
             for i in range(0, len(txt), 3000):
                 await update.message.reply_text(f"📝 ({i//3000+1}):\n\n{txt[i:i+3000]}")
         else:
             await update.message.reply_text(f"📝 텍스트:\n\n{txt}")
-        analysis = await ask_claude(u.id,
-            f"통화/음성 녹음입니다. 핵심 요약하고 중요 포인트 정리해줘:\n\n{txt}")
+        # 화자가 3명 이상으로 잡히면 회의록, 아니면 통화 요약
+        speaker_labels = set(re.findall(r"\[화자([^\]]+)\]", txt))
+        if len(speaker_labels) >= 3:
+            prompt = (
+                "여러 명이 참여한 회의 녹음입니다. 아래 화자 분리된 내용을 바탕으로 "
+                "회의록을 정리해줘. 형식은 다음과 같이:\n"
+                "1) 회의 핵심 요약 (3~5줄)\n"
+                "2) 화자별 주요 발언\n"
+                "3) 결정사항\n"
+                "4) 할 일 (담당자가 언급되면 함께)\n\n"
+                f"{txt}"
+            )
+        else:
+            prompt = f"통화/음성 녹음입니다. 핵심 요약하고 중요 포인트 정리해줘:\n\n{txt}"
+        analysis = await ask_claude(u.id, prompt)
         full = f"🔍 분석:\n\n{analysis}"
         for i in range(0, len(full), 4096):
             await update.message.reply_text(full[i:i+4096])
