@@ -1315,6 +1315,7 @@ async def cmd_clear(update, context):
     user_gmail_list[uid].clear()
     user_last_action[uid].clear()
     user_last_photo.pop(uid, None)
+    user_pending_cal[uid] = []
     user_mail_offset.pop(uid, None)
     user_mail_token.pop(uid, None)
     user_mail_query_store.pop(uid, None)
@@ -1455,7 +1456,9 @@ async def cmd_help(update, context):
         "⏰ 알림: '내일 10시에 운동가라고 알려줘'\n"
         "📅 알림목록: /schedules\n"
         "❌ 알림삭제: /scheduledel [번호]\n"
-        "📰 뉴스: /news 키워드1, 키워드2\n"
+        "📰 뉴스 키워드: /news 키워드1, 키워드2\n"
+        "📋 뉴스 목록: /newslist\n"
+        "📡 뉴스 브리핑: /briefing\n"
         "🔄 반복: '다시 보내줘'\n\n"
         "/clear - 초기화")
 
@@ -1951,6 +1954,11 @@ async def handle_message(update, context):
             re.fullmatch(r"\s*(보내|보내줘|보내라|보내자|발송|발송해|전송|전송해|응\s*보내|그래\s*보내|ㅇㅋ\s*보내|네\s*보내|보내도\s*돼|보내도돼|고고|ㄱㄱ|오케이|ok|okay|예스|좋아\s*보내|이대로\s*보내|그대로\s*보내|발송해줘|전송해줘|쏴|쏴줘|보내주세요|보내십시오|ㅇㅇ|ㅇㅋ|네|응|그래|맞아|좋아|오키)\s*", text, re.IGNORECASE)
             or (len(_ttp) <= 15 and any(w in _ttp for w in _send_words))
         )
+        _cancel_words = ["취소", "안보내", "그만", "무시", "없던걸로", "됐어", "안해", "싫어", "말아"]
+        if any(w in _ttp for w in _cancel_words) and not _is_send and not _is_edit:
+            user_last_action[u.id] = {}
+            await update.message.reply_text("✅ 답장 초안을 취소했어요.")
+            return
         if _is_send:
             la = _pending
             await update.message.reply_text(f"📧 {la['to']}로 보내는 중...")
