@@ -6,6 +6,7 @@ from email.mime.text import MIMEText
 from email import encoders
 from datetime import datetime, timedelta
 from collections import defaultdict
+from contextlib import contextmanager
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -53,59 +54,70 @@ def kst_now():
 def get_db():
     return psycopg2.connect(DATABASE_URL)
 
+@contextmanager
+def db_cursor(commit=False):
+    """DB 연결/커서를 열고, 예외가 나도 항상 닫아준다(연결 누수 방지)."""
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        yield cur
+        if commit:
+            conn.commit()
+    finally:
+        try:
+            cur.close()
+        finally:
+            conn.close()
+
 def init_db():
     if not DATABASE_URL:
         return
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS memos (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                content TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS chat_logs (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                role TEXT,
-                content TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS notified_mail_ids (
-                mail_id TEXT PRIMARY KEY,
-                notified_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS news_keywords (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                keyword TEXT,
-                created_at TIMESTAMP DEFAULT NOW(),
-                UNIQUE (user_id, keyword)
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS schedules (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                message TEXT,
-                scheduled_at TIMESTAMP,
-                sent BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        cur.execute("DELETE FROM notified_mail_ids WHERE notified_at < NOW() - INTERVAL '7 days'")
-        cur.execute("DELETE FROM schedules WHERE sent = TRUE AND created_at < NOW() - INTERVAL '30 days'")
-        conn.commit()
-        cur.close()
-        conn.close()
+        with db_cursor(commit=True) as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS memos (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    content TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS chat_logs (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    role TEXT,
+                    content TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS notified_mail_ids (
+                    mail_id TEXT PRIMARY KEY,
+                    notified_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS news_keywords (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    keyword TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE (user_id, keyword)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    message TEXT,
+                    scheduled_at TIMESTAMP,
+                    sent BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("DELETE FROM notified_mail_ids WHERE notified_at < NOW() - INTERVAL '7 days'")
+            cur.execute("DELETE FROM schedules WHERE sent = TRUE AND created_at < NOW() - INTERVAL '30 days'")
         logger.info("DB initialized!")
     except Exception as e:
         logger.error(f"DB init error: {e}")
@@ -114,12 +126,8 @@ def save_memo(user_id, content):
     if not DATABASE_URL:
         return
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO memos (user_id, content) VALUES (%s, %s)", (user_id, content))
-        conn.commit()
-        cur.close()
-        conn.close()
+        with db_cursor(commit=True) as cur:
+            cur.execute("INSERT INTO memos (user_id, content) VALUES (%s, %s)", (user_id, content))
     except Exception as e:
         logger.error(f"Memo save error: {e}")
 
@@ -127,16 +135,12 @@ def get_memos(user_id, limit=10):
     if not DATABASE_URL:
         return []
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, content, created_at FROM memos WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
-            (user_id, limit)
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return rows
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT id, content, created_at FROM memos WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+                (user_id, limit)
+            )
+            return cur.fetchall()
     except Exception as e:
         logger.error(f"Memo get error: {e}")
         return []
@@ -154,23 +158,17 @@ def delete_memo_by_number(user_id, number):
     if not DATABASE_URL:
         return False
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id FROM memos WHERE user_id=%s ORDER BY created_at DESC LIMIT 10",
-            (user_id,)
-        )
-        rows = cur.fetchall()
-        if 0 <= number - 1 < len(rows):
-            memo_id = rows[number - 1][0]
-            cur.execute("DELETE FROM memos WHERE id=%s AND user_id=%s", (memo_id, user_id))
-            conn.commit()
-            cur.close()
-            conn.close()
-            return True
-        cur.close()
-        conn.close()
-        return False
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "SELECT id FROM memos WHERE user_id=%s ORDER BY created_at DESC LIMIT 10",
+                (user_id,)
+            )
+            rows = cur.fetchall()
+            if 0 <= number - 1 < len(rows):
+                memo_id = rows[number - 1][0]
+                cur.execute("DELETE FROM memos WHERE id=%s AND user_id=%s", (memo_id, user_id))
+                return True
+            return False
     except Exception as e:
         logger.error(f"Memo delete error: {e}")
         return False
@@ -179,14 +177,9 @@ def delete_all_memos(user_id):
     if not DATABASE_URL:
         return 0
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM memos WHERE user_id=%s", (user_id,))
-        count = cur.rowcount
-        conn.commit()
-        cur.close()
-        conn.close()
-        return count
+        with db_cursor(commit=True) as cur:
+            cur.execute("DELETE FROM memos WHERE user_id=%s", (user_id,))
+            return cur.rowcount
     except Exception as e:
         logger.error(f"Memo delete all error: {e}")
         return 0
@@ -195,18 +188,14 @@ def save_news_keywords(user_id, keywords):
     if not DATABASE_URL:
         return
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        for kw in keywords:
-            kw = kw.strip()
-            if kw:
-                cur.execute(
-                    "INSERT INTO news_keywords (user_id, keyword) VALUES (%s, %s) ON CONFLICT (user_id, keyword) DO NOTHING",
-                    (user_id, kw)
-                )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with db_cursor(commit=True) as cur:
+            for kw in keywords:
+                kw = kw.strip()
+                if kw:
+                    cur.execute(
+                        "INSERT INTO news_keywords (user_id, keyword) VALUES (%s, %s) ON CONFLICT (user_id, keyword) DO NOTHING",
+                        (user_id, kw)
+                    )
     except Exception as e:
         logger.error(f"News keyword save error: {e}")
 
@@ -214,16 +203,12 @@ def get_news_keywords(user_id=None):
     if not DATABASE_URL:
         return []
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        if user_id:
-            cur.execute("SELECT id, keyword FROM news_keywords WHERE user_id=%s ORDER BY created_at", (user_id,))
-        else:
-            cur.execute("SELECT DISTINCT user_id, keyword FROM news_keywords ORDER BY user_id")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return rows
+        with db_cursor() as cur:
+            if user_id:
+                cur.execute("SELECT id, keyword FROM news_keywords WHERE user_id=%s ORDER BY created_at", (user_id,))
+            else:
+                cur.execute("SELECT DISTINCT user_id, keyword FROM news_keywords ORDER BY user_id")
+            return cur.fetchall()
     except Exception as e:
         logger.error(f"News keyword get error: {e}")
         return []
@@ -232,14 +217,9 @@ def delete_news_keyword(user_id, keyword):
     if not DATABASE_URL:
         return False
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM news_keywords WHERE user_id=%s AND keyword=%s", (user_id, keyword))
-        deleted = cur.rowcount > 0
-        conn.commit()
-        cur.close()
-        conn.close()
-        return deleted
+        with db_cursor(commit=True) as cur:
+            cur.execute("DELETE FROM news_keywords WHERE user_id=%s AND keyword=%s", (user_id, keyword))
+            return cur.rowcount > 0
     except Exception as e:
         logger.error(f"News keyword delete error: {e}")
         return False
@@ -249,15 +229,11 @@ def save_schedule(user_id, message, scheduled_at):
     if not DATABASE_URL:
         return False
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO schedules (user_id, message, scheduled_at) VALUES (%s, %s, %s)",
-            (user_id, message, scheduled_at)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO schedules (user_id, message, scheduled_at) VALUES (%s, %s, %s)",
+                (user_id, message, scheduled_at)
+            )
         return True
     except Exception as e:
         logger.error(f"Schedule save error: {e}")
@@ -267,16 +243,12 @@ def get_pending_schedules():
     if not DATABASE_URL:
         return []
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, user_id, message FROM schedules WHERE scheduled_at <= %s AND sent = FALSE",
-            (kst_now(),)
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return rows
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, message FROM schedules WHERE scheduled_at <= %s AND sent = FALSE",
+                (kst_now(),)
+            )
+            return cur.fetchall()
     except Exception as e:
         logger.error(f"Schedule get pending error: {e}")
         return []
@@ -285,12 +257,8 @@ def mark_schedule_sent(schedule_id):
     if not DATABASE_URL:
         return
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("UPDATE schedules SET sent = TRUE WHERE id = %s", (schedule_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
+        with db_cursor(commit=True) as cur:
+            cur.execute("UPDATE schedules SET sent = TRUE WHERE id = %s", (schedule_id,))
     except Exception as e:
         logger.error(f"Schedule mark sent error: {e}")
 
@@ -298,16 +266,12 @@ def get_user_schedules(user_id):
     if not DATABASE_URL:
         return []
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, message, scheduled_at FROM schedules WHERE user_id=%s AND sent=FALSE AND scheduled_at > %s ORDER BY scheduled_at LIMIT 20",
-            (user_id, kst_now())
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return rows
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT id, message, scheduled_at FROM schedules WHERE user_id=%s AND sent=FALSE AND scheduled_at > %s ORDER BY scheduled_at LIMIT 20",
+                (user_id, kst_now())
+            )
+            return cur.fetchall()
     except Exception as e:
         logger.error(f"Schedule list error: {e}")
         return []
@@ -316,23 +280,17 @@ def delete_schedule_by_number(user_id, number):
     if not DATABASE_URL:
         return False
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id FROM schedules WHERE user_id=%s AND sent=FALSE AND scheduled_at > %s ORDER BY scheduled_at LIMIT 20",
-            (user_id, kst_now())
-        )
-        rows = cur.fetchall()
-        if 0 <= number - 1 < len(rows):
-            schedule_id = rows[number - 1][0]
-            cur.execute("DELETE FROM schedules WHERE id=%s AND user_id=%s", (schedule_id, user_id))
-            conn.commit()
-            cur.close()
-            conn.close()
-            return True
-        cur.close()
-        conn.close()
-        return False
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "SELECT id FROM schedules WHERE user_id=%s AND sent=FALSE AND scheduled_at > %s ORDER BY scheduled_at LIMIT 20",
+                (user_id, kst_now())
+            )
+            rows = cur.fetchall()
+            if 0 <= number - 1 < len(rows):
+                schedule_id = rows[number - 1][0]
+                cur.execute("DELETE FROM schedules WHERE id=%s AND user_id=%s", (schedule_id, user_id))
+                return True
+            return False
     except Exception as e:
         logger.error(f"Schedule delete error: {e}")
         return False
