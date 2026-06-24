@@ -791,6 +791,7 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 [DRIVE_SEND:번호]
 [EMAIL:주소|제목|본문]
 [EMAIL_WITH_FILE:주소|제목|본문|파일번호]
+[EMAIL_LAST_FILE:주소|제목|본문]
 [GMAIL_LIST:검색쿼리]
 [GMAIL_READ:번호]
 [GMAIL_MORE]
@@ -830,15 +831,25 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 ━━━━━━━━━━━━━━━━━━━━━━━
 📧 이메일 전송 규칙
 ━━━━━━━━━━━━━━━━━━━━━━━
-주소 없을 때: 반드시 먼저 물어보기
+주소 없을 때: 반드시 먼저 "어느 메일 주소로 보낼까요?"라고 물어보기 (절대 메일 목록[GMAIL_LIST]을 보여주지 말 것)
 주소 있을 때: 제목/본문이 없어도 문맥에서 추론해서 작성
-파일 첨부: "첨부해서", "붙여서" → [EMAIL_WITH_FILE] 사용
+대화 중 이미 받는 주소가 나왔으면(예: "여기로 메일보낼건데 abc@def.com") 그 주소를 그대로 사용
 "[주소] [내용] 메일로 물어봐줘" / "메일로 전달해줘" / "메일로 보내줘" → [EMAIL:주소|제목|본문]
 본문은 자연스럽고 정중한 한국어로 Claude가 직접 작성할 것
+
+★ 드라이브 파일을 메일로 첨부 전송 (매우 중요) ★
+- "메일로 보내줘/보낼 수 있어/첨부해서 보내줘"는 메일 발송 의도임. 절대 [GMAIL_LIST](받은 메일 목록 보기)로 처리하지 말 것!
+- 방금 드라이브에서 전송(선택)한 파일을 "이거/이 파일/방금 그거/그 파일 메일로 보내줘"라고 하면
+  → [EMAIL_LAST_FILE:주소|제목|본문] (직전 파일을 자동 첨부, 번호 불필요)
+- 검색결과 목록이 떠 있는 상태에서 "N번 메일로 보내줘", "N번 첨부해서 보내줘"
+  → [EMAIL_WITH_FILE:주소|제목|본문|N]
+- 위 두 경우 모두 받는 주소를 모르면 먼저 주소를 물어볼 것 (메일 목록 보여주기 금지)
+- 제목/본문은 파일명과 대화 맥락을 보고 정중하게 자동 작성 (예: 제목 "정진수강사 프로필 보내드립니다", 본문 인사+파일 안내)
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 📬 메일 읽기 규칙
 ━━━━━━━━━━━━━━━━━━━━━━━
+(주의: 아래는 "받은 메일을 볼 때"만. "메일로 보내줘/첨부해서 보내줘"는 발송이므로 여기 해당 없음!)
 "메일 확인", "받은 메일", "최근 메일" → [GMAIL_LIST:newer_than:30d]
 "오늘 온 메일" → [GMAIL_LIST:newer_than:1d]
 "안 읽은 메일" → [GMAIL_LIST:is:unread]
@@ -2142,6 +2153,35 @@ async def handle_message(update, context):
         except Exception as e:
             logger.error(f"Drive send error: {e}")
             await update.message.reply_text("❌ 번호 확인 필요")
+
+    elif "[EMAIL_LAST_FILE:" in resp:
+        try:
+            m = re.search(r"\[EMAIL_LAST_FILE:(.*?)\]", resp, re.DOTALL)
+            parts = m.group(1).split("|", 2) if m else []
+            if len(parts) < 3:
+                await update.message.reply_text("❌ 이메일+첨부 형식 오류")
+                return
+            to_addr, subject, body = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            last = user_last_action.get(u.id, {})
+            file_id = last.get("file_id")
+            fname = last.get("name") or last.get("file_name")
+            if not file_id:
+                await update.message.reply_text("❌ 방금 보낸 파일을 못 찾았어요. 드라이브에서 파일을 먼저 검색·선택해 주세요.")
+                return
+            await update.message.reply_text(f"📧 '{fname}' 첨부하여 {to_addr}로 전송 중...")
+            buf, name = download_drive_file(file_id)
+            if buf:
+                ok, msg = send_gmail(to_addr, subject, body, buf, name)
+                if ok:
+                    await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
+                    user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject, "body": body, "file_id": file_id, "file_name": name}
+                else:
+                    await update.message.reply_text(f"❌ 전송 실패: {msg}")
+            else:
+                await update.message.reply_text("❌ 파일 다운로드 실패")
+        except Exception as e:
+            logger.error(f"Email last file error: {e}")
+            await update.message.reply_text(f"❌ 이메일 전송 실패: {e}")
 
     elif "[EMAIL_WITH_FILE:" in resp:
         try:
