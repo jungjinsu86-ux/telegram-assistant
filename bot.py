@@ -1783,12 +1783,14 @@ async def handle_message(update, context):
     _ps = user_pending_send.get(u.id, {})
     if _ps.get("stage") == "await_content":
         _pc = text.replace(" ", "")
-        if any(w in _pc for w in ["취소", "안보내", "그만", "안할래", "관둬", "됐어", "하지마", "나중에", "보류"]):
+        # 취소 판정: 메일 '내용'에 우연히 섞인 단어로 오취소되지 않도록 짧은 메시지(≤8자)일 때만
+        if len(_pc) <= 8 and any(w in _pc for w in ["취소", "안보내", "그만", "안할래", "관둬", "됐어", "하지마", "나중에", "보류", "안보낼"]):
             user_pending_send[u.id] = {}
             await update.message.reply_text("네, 메일 발송은 취소했어요. 필요하면 다시 말씀해주세요!")
             return
         to_addr, file_id, fname = _ps["to"], _ps["file_id"], _ps["file_name"]
-        _auto = any(w in _pc for w in ["알아서", "네가", "그냥보내", "대충", "센스껏", "맡길", "맡게", "알아서써", "적당히"])
+        # "알아서 써줘" 류: 짧은 메시지(≤15자)일 때만 자동작성으로 보고, 긴 내용은 실제 힌트로 사용
+        _auto = len(_pc) <= 15 and any(w in _pc for w in ["알아서", "그냥보내", "대충", "센스껏", "맡길", "맡게", "적당히", "알아서써"])
         hints = "" if _auto else text.strip()
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         composed = await ask_claude(u.id,
