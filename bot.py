@@ -838,12 +838,16 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 본문은 자연스럽고 정중한 한국어로 Claude가 직접 작성할 것
 
 ★ 드라이브 파일을 메일로 첨부 전송 (매우 중요) ★
-- "메일로 보내줘/보낼 수 있어/첨부해서 보내줘"는 메일 발송 의도임. 절대 [GMAIL_LIST](받은 메일 목록 보기)로 처리하지 말 것!
-- 방금 드라이브에서 전송(선택)한 파일을 "이거/이 파일/방금 그거/그 파일 메일로 보내줘"라고 하면
-  → [EMAIL_LAST_FILE:주소|제목|본문] (직전 파일을 자동 첨부, 번호 불필요)
-- 검색결과 목록이 떠 있는 상태에서 "N번 메일로 보내줘", "N번 첨부해서 보내줘"
+- 발송 의도 표현은 매우 다양함. 아래는 모두 "메일 발송" 의도이며 절대 [GMAIL_LIST](받은 메일 목록 보기)로 처리 금지:
+  "메일로 보내줘", "보낼 수 있어?", "첨부해서 보내줘", "메일로 발송해줘", "송부해줘",
+  "전달해줘", "쏴줘", "넘겨줘", "부쳐줘", "포워딩해줘", "메일링해줘", "이 주소로 보내줘",
+  "여기로 보내줘", "○○@○○.com으로 보내줘" 등 (단어가 조금 달라도 '어딘가로 보낸다'는 뜻이면 발송)
+- 방금 드라이브에서 전송(선택)한 파일을 "이거/이 파일/방금 그거/그 파일/아까 그거 메일로 보내줘(또는 위 파생어)"
+  → [EMAIL_LAST_FILE:주소|제목|본문] (직전 파일 자동 첨부, 번호 불필요)
+- 검색결과 목록이 떠 있는 상태에서 "N번 메일로 보내줘", "N번 첨부해서 발송", "N번 그거 ○○로 쏴줘" 등
   → [EMAIL_WITH_FILE:주소|제목|본문|N]
-- 위 두 경우 모두 받는 주소를 모르면 먼저 주소를 물어볼 것 (메일 목록 보여주기 금지)
+- 받는 주소 정하기: ① 이번 문장에 주소가 있으면 그걸 사용 ② 없으면 앞선 대화에서 사용자가 말한 메일 주소를 사용
+  ③ 그래도 모르면 "어느 메일 주소로 보낼까요?"라고 먼저 물어볼 것 (메일 목록 보여주기 금지)
 - 제목/본문은 파일명과 대화 맥락을 보고 정중하게 자동 작성 (예: 제목 "정진수강사 프로필 보내드립니다", 본문 인사+파일 안내)
 
 ━━━━━━━━━━━━━━━━━━━━━━━
@@ -1150,6 +1154,23 @@ user_last_action = defaultdict(dict)
 user_last_photo = {}
 user_pending_cal = defaultdict(list)  # 캘린더 캡처에서 뽑은 일정 (저장 대기)
 user_pending_send = defaultdict(dict)  # 드라이브 검색과 함께 받은 "이 주소로 메일 보내줘" 대기 정보
+user_last_addr = {}  # uid -> 사용자가 가장 최근에 말한 메일 주소 (이전 대화 맥락 유지용)
+
+# 메일 주소 추출 / 발송 의도 판별 (파생어·확장어 폭넓게 인식)
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# "메일/이메일"이라는 단어 없이도 발송으로 볼 수 있는 동사·표현들
+_SEND_VERBS = ["보내", "보낼", "발송", "송부", "전달", "전송", "쏴", "쏠", "쏘아",
+               "넘겨", "넘기", "부쳐", "부치", "포워", "포워딩", "fw", "fwd", "메일링"]
+# 메일/주소 맥락 신호 (이게 있으면 발송 의도로 더 강하게 본다)
+_MAIL_HINTS = ["메일", "이메일", "메일로", "이메일로", "여기로", "이리로", "이주소", "이 주소", "@"]
+
+def _has_send_intent(s):
+    """문장에 '어딘가로 보내달라'는 발송 의도가 있는지 폭넓게 판별."""
+    t = s.replace(" ", "").lower()
+    has_verb = any(v in t for v in _SEND_VERBS)
+    has_mail = any(h.replace(" ", "") in t for h in _MAIL_HINTS)
+    # 발송 동사 + (메일/주소 신호)  또는  메일 단어 + 동사
+    return has_verb and has_mail
 user_mail_offset = {}    # uid -> 다음 표시 시작 인덱스 (0-based)
 user_mail_token = {}     # uid -> nextPageToken (None이면 마지막 페이지)
 user_mail_query_store = {}  # uid -> 현재 페이지네이션 중인 Gmail 쿼리
@@ -1739,6 +1760,11 @@ async def handle_message(update, context):
 
     text = update.message.text or ""
 
+    # 이전 대화 맥락 유지: 메시지에 메일 주소가 보이면 항상 기억해 둔다 (나중에 "이거 메일로 보내줘"에 활용)
+    _addr_now = EMAIL_RE.search(text)
+    if _addr_now:
+        user_last_addr[u.id] = _addr_now.group(0)
+
     # 👀 메시지 받자마자 '읽고 작업 중' 반응 표시
     try:
         await context.bot.set_message_reaction(
@@ -2099,12 +2125,12 @@ async def handle_message(update, context):
         if files:
             user_search_results[u.id] = files
             user_last_list[u.id] = 'drive'
-            # "여기로 메일보낼건데 ... 검색해줘"처럼 메일 발송 의도+주소가 같이 오면 기억해 둔다
-            _addr = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
-            _send_intent = ("메일" in text or "이메일" in text or "메일로" in text.replace(" ", "")) and \
-                           any(w in text for w in ["보낼", "보내", "여기로", "전달", "첨부"])
-            if _addr and _send_intent:
-                user_pending_send[u.id] = {"to": _addr.group(0)}
+            # "여기로 메일보낼건데 ... 검색해줘"처럼 메일 발송 의도가 있으면 주소를 기억해 둔다.
+            # 주소는 이번 메시지에 없어도 직전 대화에서 말한 주소(user_last_addr)를 사용 → 이전 맥락 유지
+            _m_addr = EMAIL_RE.search(text)
+            _addr = _m_addr.group(0) if _m_addr else user_last_addr.get(u.id)
+            if _addr and _has_send_intent(text):
+                user_pending_send[u.id] = {"to": _addr}
             else:
                 user_pending_send[u.id] = {}
             _pend = user_pending_send.get(u.id, {}).get("to")
