@@ -1815,7 +1815,7 @@ async def handle_message(update, context):
             ok, emsg = send_gmail(to_addr, subject, body, buf, name)
             if ok:
                 user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject,
-                                          "body": body, "file_id": file_id, "file_name": name}
+                                          "body": body, "file_id": file_id, "file_name": name, "sent": True}
                 await update.message.reply_text(
                     f"✅ 보냈어요! ({to_addr})\n\n📌 제목: {subject}\n━━━━━━━━━\n{body}")
             else:
@@ -2008,8 +2008,9 @@ async def handle_message(update, context):
         return
 
     # ── 답장 초안 대기 중일 때: 발송 / 수정 처리 (자연스러운 말도 인식)
+    #     이미 발송 완료된 기록(sent=True)은 초안이 아니므로 제외 → "응/네" 한마디에 재발송되는 사고 방지
     _pending = user_last_action.get(u.id, {})
-    if _pending.get("type") == "email" and _pending.get("body"):
+    if _pending.get("type") == "email" and _pending.get("body") and not _pending.get("sent"):
         _ttp = text.replace(" ", "")
         _send_words = ["보내", "발송", "전송", "쏴", "쏘아", "송부", "ㄱㄱ", "고고", "오케이", "ok", "okay", "예스",
                        "응", "그래", "맞아", "ㅇㅇ", "ㅇㅋ", "네", "좋아", "오키", "콜"]
@@ -2250,7 +2251,7 @@ async def handle_message(update, context):
                 ok, msg = send_gmail(to_addr, subject, body, buf, name)
                 if ok:
                     await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
-                    user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject, "body": body, "file_id": file_id, "file_name": name}
+                    user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject, "body": body, "file_id": file_id, "file_name": name, "sent": True}
                 else:
                     await update.message.reply_text(f"❌ 전송 실패: {msg}")
             else:
@@ -2276,7 +2277,7 @@ async def handle_message(update, context):
                     ok, msg = send_gmail(to_addr, subject, body, buf, name)
                     if ok:
                         await update.message.reply_text(f"✅ {to_addr}로 전송 완료!")
-                        user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject, "body": body, "file_id": fi["id"], "file_name": name}
+                        user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject, "body": body, "file_id": fi["id"], "file_name": name, "sent": True}
                     else:
                         await update.message.reply_text(f"❌ 전송 실패: {msg}")
                 else:
@@ -2299,7 +2300,7 @@ async def handle_message(update, context):
             ok, msg = send_gmail(to_addr, subject, body)
             if ok:
                 await update.message.reply_text(f"✅ 메일 전송 완료 ({to_addr})")
-                user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject, "body": body}
+                user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject, "body": body, "sent": True}
             else:
                 await update.message.reply_text(f"❌ 전송 실패: {msg}")
         except Exception as e:
