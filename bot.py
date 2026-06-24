@@ -1149,6 +1149,7 @@ user_last_mail = defaultdict(dict)  # 마지막으로 연 메일 (답장용)
 user_last_action = defaultdict(dict)
 user_last_photo = {}
 user_pending_cal = defaultdict(list)  # 캘린더 캡처에서 뽑은 일정 (저장 대기)
+user_pending_send = defaultdict(dict)  # 드라이브 검색과 함께 받은 "이 주소로 메일 보내줘" 대기 정보
 user_mail_offset = {}    # uid -> 다음 표시 시작 인덱스 (0-based)
 user_mail_token = {}     # uid -> nextPageToken (None이면 마지막 페이지)
 user_mail_query_store = {}  # uid -> 현재 페이지네이션 중인 Gmail 쿼리
@@ -2098,10 +2099,22 @@ async def handle_message(update, context):
         if files:
             user_search_results[u.id] = files
             user_last_list[u.id] = 'drive'
+            # "여기로 메일보낼건데 ... 검색해줘"처럼 메일 발송 의도+주소가 같이 오면 기억해 둔다
+            _addr = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
+            _send_intent = ("메일" in text or "이메일" in text or "메일로" in text.replace(" ", "")) and \
+                           any(w in text for w in ["보낼", "보내", "여기로", "전달", "첨부"])
+            if _addr and _send_intent:
+                user_pending_send[u.id] = {"to": _addr.group(0)}
+            else:
+                user_pending_send[u.id] = {}
+            _pend = user_pending_send.get(u.id, {}).get("to")
             msg = f"🔍 '{kw}' 검색 결과:\n\n"
             for i, f in enumerate(files, 1):
                 msg += f"{i}. {_drive_icon(f)} {f['name']} ({f.get('modifiedTime','')[:10]})\n"
-            msg += "\n💡 번호 입력 → 파일은 전송, 폴더는 내용 보기!"
+            if _pend:
+                msg += f"\n💡 번호를 누르면 그 파일을 바로 {_pend} 로 메일 전송해요! (폴더는 내용 보기)"
+            else:
+                msg += "\n💡 번호 입력 → 파일은 전송, 폴더는 내용 보기!"
             for i in range(0, len(msg), 4096):
                 await update.message.reply_text(msg[i:i+4096])
         else:
@@ -2139,6 +2152,25 @@ async def handle_message(update, context):
                             await update.message.reply_text(msg[i:i+4096])
                     else:
                         await update.message.reply_text(f"📁 '{fi['name']}' 폴더가 비어 있어요.")
+                    return
+                # "여기로 메일보낼건데"라고 미리 말한 주소가 있으면 → 텔레그램 다운로드 대신 바로 메일 첨부 전송
+                _pend_to = user_pending_send.get(u.id, {}).get("to")
+                if _pend_to:
+                    await update.message.reply_text(f"📧 '{fi['name']}' 첨부하여 {_pend_to} 로 전송 중...")
+                    buf, name = download_drive_file(fi["id"])
+                    if buf:
+                        _subj = f"{fi['name']} 보내드립니다"
+                        _body = (f"안녕하세요.\n\n요청하신 '{fi['name']}' 파일을 첨부하여 보내드립니다.\n"
+                                 f"확인 부탁드립니다.\n\n감사합니다.")
+                        ok, emsg = send_gmail(_pend_to, _subj, _body, buf, name)
+                        if ok:
+                            await update.message.reply_text(f"✅ {_pend_to} 로 '{name}' 전송 완료!")
+                            user_last_action[u.id] = {"type": "email", "to": _pend_to, "subject": _subj, "body": _body, "file_id": fi["id"], "file_name": name}
+                        else:
+                            await update.message.reply_text(f"❌ 전송 실패: {emsg}")
+                    else:
+                        await update.message.reply_text("❌ 파일 다운로드 실패")
+                    user_pending_send[u.id] = {}
                     return
                 await update.message.reply_text(f"📤 '{fi['name']}' 전송 중...")
                 buf, name = download_drive_file(fi["id"])
