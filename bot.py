@@ -860,6 +860,9 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 - "내일 10시에 운동가라고 알려줘" → [SCHEDULE:2026-05-17 10:00|운동 가세요!]
 - "30분 후에 알림줘" → 현재 KST 기준 30분 후 계산 → [SCHEDULE:YYYY-MM-DD HH:MM|내용]
 - "이번 주 금요일 오후 3시에 미팅 알려줘" → 날짜 계산 후 [SCHEDULE:...]
+- ⭐ 한 번에 여러 시간을 말하면 시간마다 [SCHEDULE:...] 태그를 각각 따로 출력할 것 (개수 제한 없음)
+  예) "내일 11시, 1시, 5시반에 알려줘" →
+  [SCHEDULE:2026-06-25 11:00|내용][SCHEDULE:2026-06-25 13:00|내용][SCHEDULE:2026-06-25 17:30|내용]
 - 알림 내용은 대표님이 말씀하신 내용 그대로 간결하게 (예: "운동 가세요!", "미팅 시간이에요!")
 - 과거 시간 요청 시 "이미 지난 시간이에요"라고 알릴 것
 - KST 기준으로 날짜/시간 계산할 것
@@ -2295,18 +2298,48 @@ async def handle_message(update, context):
 
     elif "[SCHEDULE:" in resp:
         try:
-            m = re.search(r"\[SCHEDULE:(.*?)\]", resp)
-            inner = m.group(1) if m else ""
-            dt_str, msg_content = inner.split("|", 1)
-            scheduled_at = datetime.strptime(dt_str.strip(), "%Y-%m-%d %H:%M")
-            if scheduled_at <= kst_now():
-                await update.message.reply_text("⚠️ 이미 지난 시간이에요. 다시 설정해주세요.")
-            elif save_schedule(u.id, msg_content.strip(), scheduled_at):
-                await update.message.reply_text(
-                    f"⏰ 알림 설정 완료!\n\n"
-                    f"📅 {scheduled_at.strftime('%Y.%m.%d %H:%M')}\n"
-                    f"📝 {msg_content.strip()}"
-                )
+            matches = re.findall(r"\[SCHEDULE:(.*?)\]", resp)
+            saved = []      # (scheduled_at, 내용)
+            past = 0        # 이미 지난 시간
+            fails = 0       # 저장 실패 / 형식 오류
+            for inner in matches:
+                try:
+                    dt_str, msg_content = inner.split("|", 1)
+                    scheduled_at = datetime.strptime(dt_str.strip(), "%Y-%m-%d %H:%M")
+                    if scheduled_at <= kst_now():
+                        past += 1
+                    elif save_schedule(u.id, msg_content.strip(), scheduled_at):
+                        saved.append((scheduled_at, msg_content.strip()))
+                    else:
+                        fails += 1
+                except Exception as e:
+                    logger.error(f"Schedule parse error: {e} / inner={inner!r}")
+                    fails += 1
+
+            if saved:
+                saved.sort(key=lambda x: x[0])
+                if len(saved) == 1:
+                    sa, mc = saved[0]
+                    reply = (
+                        f"⏰ 알림 설정 완료!\n\n"
+                        f"📅 {sa.strftime('%Y.%m.%d %H:%M')}\n"
+                        f"📝 {mc}"
+                    )
+                else:
+                    reply = f"⏰ 알림 {len(saved)}개 설정 완료!\n\n"
+                    for i, (sa, mc) in enumerate(saved, 1):
+                        reply += f"{i}. {sa.strftime('%Y.%m.%d %H:%M')} - {mc}\n"
+                    reply = reply.rstrip()
+                extra = []
+                if past:
+                    extra.append(f"이미 지난 시간 {past}개는 건너뛰었어요")
+                if fails:
+                    extra.append(f"{fails}개는 형식 오류로 실패했어요")
+                if extra:
+                    reply += "\n\n⚠️ " + ", ".join(extra) + "."
+                await update.message.reply_text(reply)
+            elif past and not fails:
+                await update.message.reply_text("⚠️ 모두 이미 지난 시간이에요. 다시 설정해주세요.")
             else:
                 await update.message.reply_text("❌ 알림 저장 실패")
         except Exception as e:
