@@ -1777,6 +1777,54 @@ async def handle_message(update, context):
             await update.message.reply_text(result[i:i+4096])
         return
 
+    # ── 드라이브 파일 메일발송: "어떤 내용으로?" 물어본 직후 → 답변을 받아 비즈니스 메일 작성 후 발송
+    _ps = user_pending_send.get(u.id, {})
+    if _ps.get("stage") == "await_content":
+        _pc = text.replace(" ", "")
+        if any(w in _pc for w in ["취소", "안보내", "그만", "안할래", "관둬", "됐어", "하지마", "나중에", "보류"]):
+            user_pending_send[u.id] = {}
+            await update.message.reply_text("네, 메일 발송은 취소했어요. 필요하면 다시 말씀해주세요!")
+            return
+        to_addr, file_id, fname = _ps["to"], _ps["file_id"], _ps["file_name"]
+        _auto = any(w in _pc for w in ["알아서", "네가", "그냥보내", "대충", "센스껏", "맡길", "맡게", "알아서써", "적당히"])
+        hints = "" if _auto else text.strip()
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        composed = await ask_claude(u.id,
+            "너는 정진수 대표님의 비서야. 첨부파일을 보내는 정중한 한국어 비즈니스 이메일을 작성해. "
+            "반드시 아래 형식으로만 출력하고 다른 말은 절대 하지 마:\n"
+            "제목: (한 줄)\n본문:\n(여러 줄)\n\n"
+            "본문은 정중한 인사 → 용건(첨부파일 안내) → 맺음말 순서이고, 맨 끝 줄에 '정진수 드림'을 넣어. "
+            "과하지 않고 자연스러운 비즈니스 톤으로 작성해.\n\n"
+            f"[받는사람] {to_addr}\n[첨부파일명] {fname}\n"
+            f"[대표님이 준 참고내용] {hints or '특별한 지시 없음 — 파일 공유 목적의 일반적인 비즈니스 메일로 작성'}")
+        composed = re.sub(r"\[[A-Z_]+:.*?\]", "", composed).strip()
+        m_subj = re.search(r"제목\s*[:：]\s*(.+)", composed)
+        subject = m_subj.group(1).strip() if m_subj else f"{fname} 보내드립니다"
+        if "본문:" in composed:
+            body = composed.split("본문:", 1)[1].strip()
+        elif "본문：" in composed:
+            body = composed.split("본문：", 1)[1].strip()
+        else:
+            body = re.sub(r"제목\s*[:：].*\n?", "", composed).strip()
+        if not body:
+            body = (f"안녕하세요.\n\n요청하신 '{fname}' 파일을 첨부하여 보내드립니다.\n"
+                    f"확인 부탁드립니다.\n\n감사합니다.\n정진수 드림")
+        await update.message.reply_text(f"📧 '{fname}' 첨부해서 {to_addr} 로 보내는 중...")
+        buf, name = download_drive_file(file_id)
+        if buf:
+            ok, emsg = send_gmail(to_addr, subject, body, buf, name)
+            if ok:
+                user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject,
+                                          "body": body, "file_id": file_id, "file_name": name}
+                await update.message.reply_text(
+                    f"✅ 보냈어요! ({to_addr})\n\n📌 제목: {subject}\n━━━━━━━━━\n{body}")
+            else:
+                await update.message.reply_text(f"❌ 전송 실패: {emsg}")
+        else:
+            await update.message.reply_text("❌ 파일 다운로드 실패")
+        user_pending_send[u.id] = {}
+        return
+
     # ── 캘린더 캡처에서 뽑은 일정 저장 대기 중: "저장해줘 / N번 빼고 저장 / 취소"
     if user_pending_cal.get(u.id):
         _pc = text.replace(" ", "")
@@ -2155,24 +2203,18 @@ async def handle_message(update, context):
                     else:
                         await update.message.reply_text(f"📁 '{fi['name']}' 폴더가 비어 있어요.")
                     return
-                # "여기로 메일보낼건데"라고 미리 말한 주소가 있으면 → 텔레그램 다운로드 대신 바로 메일 첨부 전송
+                # "여기로 메일보낼건데"라고 미리 말한 주소가 있으면 → 바로 보내지 말고 먼저 "어떤 내용으로?" 물어본다
                 _pend_to = user_pending_send.get(u.id, {}).get("to")
                 if _pend_to:
-                    await update.message.reply_text(f"📧 '{fi['name']}' 첨부하여 {_pend_to} 로 전송 중...")
-                    buf, name = download_drive_file(fi["id"])
-                    if buf:
-                        _subj = f"{fi['name']} 보내드립니다"
-                        _body = (f"안녕하세요.\n\n요청하신 '{fi['name']}' 파일을 첨부하여 보내드립니다.\n"
-                                 f"확인 부탁드립니다.\n\n감사합니다.")
-                        ok, emsg = send_gmail(_pend_to, _subj, _body, buf, name)
-                        if ok:
-                            await update.message.reply_text(f"✅ {_pend_to} 로 '{name}' 전송 완료!")
-                            user_last_action[u.id] = {"type": "email", "to": _pend_to, "subject": _subj, "body": _body, "file_id": fi["id"], "file_name": name}
-                        else:
-                            await update.message.reply_text(f"❌ 전송 실패: {emsg}")
-                    else:
-                        await update.message.reply_text("❌ 파일 다운로드 실패")
-                    user_pending_send[u.id] = {}
+                    user_pending_send[u.id] = {
+                        "to": _pend_to, "file_id": fi["id"], "file_name": fi["name"], "stage": "await_content"
+                    }
+                    await update.message.reply_text(
+                        f"📧 '{fi['name']}' 파일을 {_pend_to} 로 보낼게요!\n\n"
+                        f"어떤 내용으로 보낼까요? 메일에 넣을 내용이나 참고할 점을 알려주시면 "
+                        f"제가 비즈니스 메일로 정중하게 작성해서 보내드릴게요.\n"
+                        f"(그냥 \"알아서 보내줘\" 하셔도 제가 센스껏 써서 보낼게요 😊)"
+                    )
                     return
                 await update.message.reply_text(f"📤 '{fi['name']}' 전송 중...")
                 buf, name = download_drive_file(fi["id"])
