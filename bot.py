@@ -1809,20 +1809,16 @@ async def handle_message(update, context):
         if not body:
             body = (f"안녕하세요.\n\n요청하신 '{fname}' 파일을 첨부하여 보내드립니다.\n"
                     f"확인 부탁드립니다.\n\n감사합니다.\n정진수 드림")
-        await update.message.reply_text(f"📧 '{fname}' 첨부해서 {to_addr} 로 보내는 중...")
-        buf, name = download_drive_file(file_id)
-        if buf:
-            ok, emsg = send_gmail(to_addr, subject, body, buf, name)
-            if ok:
-                user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject,
-                                          "body": body, "file_id": file_id, "file_name": name, "sent": True}
-                await update.message.reply_text(
-                    f"✅ 보냈어요! ({to_addr})\n\n📌 제목: {subject}\n━━━━━━━━━\n{body}")
-            else:
-                await update.message.reply_text(f"❌ 전송 실패: {emsg}")
-        else:
-            await update.message.reply_text("❌ 파일 다운로드 실패")
+        # 바로 보내지 않고 초안을 보여준 뒤 컨펌("보내줘") 받으면 발송 (초안 확인/수정/취소 머신러리 재활용)
+        user_last_action[u.id] = {"type": "email", "to": to_addr, "subject": subject,
+                                  "body": body, "file_id": file_id, "file_name": fname}
         user_pending_send[u.id] = {}
+        preview = (f"✍️ 이렇게 작성했어요 (아직 안 보냈어요!)\n\n"
+                   f"받는 사람: {to_addr}\n📎 첨부: {fname}\n📌 제목: {subject}\n"
+                   f"━━━━━━━━━\n{body}\n"
+                   f"━━━━━━━━━\n이대로 보내려면 \"보내줘\", 고치려면 어떻게 고칠지 말씀해주세요. (취소는 \"취소\")")
+        for i in range(0, len(preview), 4096):
+            await update.message.reply_text(preview[i:i+4096])
         return
 
     # ── 캘린더 캡처에서 뽑은 일정 저장 대기 중: "저장해줘 / N번 빼고 저장 / 취소"
@@ -2023,14 +2019,23 @@ async def handle_message(update, context):
         _cancel_words = ["취소", "안보내", "보내지마", "그만", "무시", "없던걸로", "됐어", "안해", "하지마", "싫어", "말아", "나중에", "보류"]
         if any(w in _ttp for w in _cancel_words) and not _is_send and not _is_edit:
             user_last_action[u.id] = {}
-            await update.message.reply_text("✅ 답장 초안을 취소했어요.")
+            await update.message.reply_text("✅ 초안을 취소했어요. 안 보냈으니 안심하세요!")
             return
         if _is_send:
             la = _pending
             await update.message.reply_text(f"📧 {la['to']}로 보내는 중...")
-            ok, msg = send_gmail(la["to"], la["subject"], la["body"])
-            await update.message.reply_text(f"✅ 답장 보냈어요! ({la['to']})" if ok else f"❌ 전송 실패: {msg}")
-            user_last_action[u.id] = {}
+            _buf = _nm = None
+            if la.get("file_id"):
+                _buf, _nm = download_drive_file(la["file_id"])
+            ok, msg = send_gmail(la["to"], la["subject"], la["body"], _buf, _nm or la.get("file_name"))
+            if ok:
+                if la.get("file_id"):
+                    await update.message.reply_text(f"✅ '{_nm or la.get('file_name')}' 첨부해서 보냈어요! ({la['to']})")
+                else:
+                    await update.message.reply_text(f"✅ 보냈어요! ({la['to']})")
+                user_last_action[u.id] = {**la, "sent": True}  # 보낸 기록(다시보내기용) + 재발송 방지 플래그
+            else:
+                await update.message.reply_text(f"❌ 전송 실패: {msg}")
             return
         if _is_edit:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -2038,9 +2043,11 @@ async def handle_message(update, context):
                 "아래 이메일 초안을 사용자의 요청대로 고쳐서, 수정된 '본문'만 출력해. 설명/되묻기 없이 본문만. 끝에 '정진수 드림' 유지.\n\n"
                 f"[사용자 요청] {text}\n\n[기존 초안]\n{_pending['body']}")
             newdraft = re.sub(r"\[[A-Z_]+:.*?\]", "", newdraft).strip() or _pending["body"]
-            user_last_action[u.id] = {"type": "email", "to": _pending["to"], "subject": _pending["subject"], "body": newdraft}
-            preview = (f"✍️ 수정한 답장 초안이에요 (아직 안 보냈어요)\n\n"
-                       f"받는 사람: {_pending['to']}\n제목: {_pending['subject']}\n\n{newdraft}\n\n"
+            user_last_action[u.id] = {"type": "email", "to": _pending["to"], "subject": _pending["subject"],
+                                      "body": newdraft, "file_id": _pending.get("file_id"), "file_name": _pending.get("file_name")}
+            _att_line = f"📎 첨부: {_pending.get('file_name')}\n" if _pending.get("file_id") else ""
+            preview = (f"✍️ 수정한 초안이에요 (아직 안 보냈어요)\n\n"
+                       f"받는 사람: {_pending['to']}\n{_att_line}제목: {_pending['subject']}\n\n{newdraft}\n\n"
                        f"━━━━━━━━━\n보내려면 \"보내줘\", 더 고치려면 어떻게 고칠지 말씀해주세요.")
             for i in range(0, len(preview), 4096):
                 await update.message.reply_text(preview[i:i+4096])
@@ -2211,10 +2218,10 @@ async def handle_message(update, context):
                         "to": _pend_to, "file_id": fi["id"], "file_name": fi["name"], "stage": "await_content"
                     }
                     await update.message.reply_text(
-                        f"📧 '{fi['name']}' 파일을 {_pend_to} 로 보낼게요!\n\n"
+                        f"📧 '{fi['name']}' 파일을 {_pend_to} 로 보낼 준비할게요!\n\n"
                         f"어떤 내용으로 보낼까요? 메일에 넣을 내용이나 참고할 점을 알려주시면 "
-                        f"제가 비즈니스 메일로 정중하게 작성해서 보내드릴게요.\n"
-                        f"(그냥 \"알아서 보내줘\" 하셔도 제가 센스껏 써서 보낼게요 😊)"
+                        f"제가 비즈니스 메일로 정중하게 작성해서 보여드릴게요. 확인하고 \"보내줘\" 하시면 발송할게요!\n"
+                        f"(특별한 내용 없으면 \"알아서 써줘\" 하셔도 돼요 😊)"
                     )
                     return
                 await update.message.reply_text(f"📤 '{fi['name']}' 전송 중...")
