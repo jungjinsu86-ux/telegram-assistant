@@ -458,6 +458,9 @@ def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
     if not gmail_service or not gmail_creds:
         return False, "Gmail not connected"
     try:
+        # 헤더 인젝션 방지: 받는주소/제목의 개행 제거
+        to_addr = (to_addr or "").replace("\r", "").replace("\n", "").strip()
+        subject = (subject or "").replace("\r", " ").replace("\n", " ").strip()
         gmail_creds.refresh(Request())
         msg = MIMEMultipart()
         msg["From"] = GMAIL_ADDRESS
@@ -1355,6 +1358,12 @@ async def cmd_clear(update, context):
     user_mail_offset.pop(uid, None)
     user_mail_token.pop(uid, None)
     user_mail_query_store.pop(uid, None)
+    # 메일 발송 대기/기억 정보도 초기화 (오발송 방지)
+    user_pending_send.pop(uid, None)
+    user_last_addr.pop(uid, None)
+    user_last_mail.pop(uid, None)
+    user_mail_attachments.pop(uid, None)
+    user_last_list.pop(uid, None)
     await update.message.reply_text("🗑️ 초기화 완료!")
 
 async def cmd_memo(update, context):
@@ -1484,6 +1493,7 @@ async def cmd_help(update, context):
         "🔍 검색: '오늘 뉴스', '코스피' 등\n"
         "📁 파일: '파일 찾아줘', '보내줘', /files\n"
         "📧 이메일: 'abc@gmail.com에 안녕 보내줘'\n"
+        "📎 파일 메일전송: 'abc@gmail.com로 보낼건데 ○○ 찾아줘' → 번호 누르면 바로 첨부발송\n"
         "📬 메일: /mail, '받은 메일 보여줘'\n"
         "🎙️ 음성: 음성/m4a 파일 보내면 자동 분석\n"
         "📝 메모: /memo [내용], /memos\n"
@@ -1951,7 +1961,7 @@ async def handle_message(update, context):
             return
 
         # 보낸 사람 주소 추출
-        addr_m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", target.get("from",""))
+        addr_m = EMAIL_RE.search(target.get("from",""))
         if not addr_m:
             await update.message.reply_text("이 메일에서 보낸 사람 주소를 못 찾았어요. 답장 주소를 직접 알려주세요.")
             return
@@ -1987,15 +1997,15 @@ async def handle_message(update, context):
     _pending = user_last_action.get(u.id, {})
     if _pending.get("type") == "email" and _pending.get("body"):
         _ttp = text.replace(" ", "")
-        _send_words = ["보내", "발송", "전송", "쏴", "ㄱㄱ", "고고", "오케이", "ok", "okay", "예스",
-                       "응", "그래", "맞아", "ㅇㅇ", "ㅇㅋ", "네", "좋아", "오키"]
-        _edit_words = ["고쳐", "수정", "바꿔", "짧게", "길게", "정중", "다르게", "추가", "빼", "말투", "다시써", "다시작성", "고쳐줘", "수정해"]
+        _send_words = ["보내", "발송", "전송", "쏴", "쏘아", "송부", "ㄱㄱ", "고고", "오케이", "ok", "okay", "예스",
+                       "응", "그래", "맞아", "ㅇㅇ", "ㅇㅋ", "네", "좋아", "오키", "콜"]
+        _edit_words = ["고쳐", "수정", "바꿔", "짧게", "길게", "정중", "다르게", "추가", "빼", "말투", "다시써", "다시작성", "고쳐줘", "수정해", "줄여", "늘려", "바꿔줘"]
         _is_edit = any(w in _ttp for w in _edit_words)
         _is_send = (not _is_edit) and (not any(w in _ttp for w in ["첨부", "파일"])) and (
             re.fullmatch(r"\s*(보내|보내줘|보내라|보내자|발송|발송해|전송|전송해|응\s*보내|그래\s*보내|ㅇㅋ\s*보내|네\s*보내|보내도\s*돼|보내도돼|고고|ㄱㄱ|오케이|ok|okay|예스|좋아\s*보내|이대로\s*보내|그대로\s*보내|발송해줘|전송해줘|쏴|쏴줘|보내주세요|보내십시오|ㅇㅇ|ㅇㅋ|네|응|그래|맞아|좋아|오키)\s*", text, re.IGNORECASE)
             or (len(_ttp) <= 15 and any(w in _ttp for w in _send_words))
         )
-        _cancel_words = ["취소", "안보내", "그만", "무시", "없던걸로", "됐어", "안해", "싫어", "말아"]
+        _cancel_words = ["취소", "안보내", "보내지마", "그만", "무시", "없던걸로", "됐어", "안해", "하지마", "싫어", "말아", "나중에", "보류"]
         if any(w in _ttp for w in _cancel_words) and not _is_send and not _is_edit:
             user_last_action[u.id] = {}
             await update.message.reply_text("✅ 답장 초안을 취소했어요.")
