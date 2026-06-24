@@ -769,6 +769,8 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 ━━━━━━━━━━━━━━━━━━━━━━━
 검색 트리거:
 "찾아줘", "어딨어", "검색해", "있어?" → [DRIVE_SEARCH:핵심단어]
+※ 검색어는 '내/제/나의/그/우리' 같은 군더더기를 빼고 핵심 명사만 넣어.
+  예) "내 프로필 찾아줘" → [DRIVE_SEARCH:프로필], "제 이력서 어딨어" → [DRIVE_SEARCH:이력서]
 
 전송 트리거:
 "줘", "보내줘", "전송해", "받고싶어", "보내라고",
@@ -2148,12 +2150,24 @@ async def handle_message(update, context):
         m = re.search(r"\[DRIVE_SEARCH:(.*?)\]", resp)
         kw = m.group(1) if m else ""
         files = search_drive_files(kw)
-        if not files:
-            kw_clean = kw.replace("폴더", "").replace("파일", "").strip()
-            if kw_clean and kw_clean != kw:
-                files = search_drive_files(kw_clean)
-                if files:
-                    kw = kw_clean
+        if not files and kw:
+            # 결과 없으면 군더더기("내/제/나의/폴더/파일" 등) 떼고 재시도 → AI가 검색어를 다르게 뽑아도 견고하게
+            FILLERS = {"내", "제", "나의", "저의", "그", "저", "폴더", "파일", "좀", "우리", "내꺼", "제꺼", "것", "거", "관련"}
+            tries = []
+            toks = [t for t in re.split(r"\s+", kw.strip()) if t and t not in FILLERS]
+            cleaned = " ".join(toks)
+            if cleaned and cleaned != kw.strip():
+                tries.append(cleaned)
+            stripped = re.sub(r"^(내|제|나의|저의|우리)", "", kw.strip()).strip()  # "내프로필"→"프로필"
+            if stripped and stripped != kw.strip() and stripped not in tries:
+                tries.append(stripped)
+            if len(toks) > 1 and toks[-1] not in tries:  # 마지막 핵심 명사 단독
+                tries.append(toks[-1])
+            for v in tries:
+                found = search_drive_files(v)
+                if found:
+                    files, kw = found, v
+                    break
         if files:
             user_search_results[u.id] = files
             user_last_list[u.id] = 'drive'
