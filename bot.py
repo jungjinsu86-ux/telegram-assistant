@@ -118,6 +118,7 @@ def init_db():
             """)
             cur.execute("DELETE FROM notified_mail_ids WHERE notified_at < NOW() - INTERVAL '7 days'")
             cur.execute("DELETE FROM schedules WHERE sent = TRUE AND created_at < NOW() - INTERVAL '30 days'")
+            cur.execute("DELETE FROM chat_logs WHERE created_at < NOW() - INTERVAL '30 days'")
         logger.info("DB initialized!")
     except Exception as e:
         logger.error(f"DB init error: {e}")
@@ -144,6 +145,42 @@ def get_memos(user_id, limit=10):
     except Exception as e:
         logger.error(f"Memo get error: {e}")
         return []
+
+def save_chat_log(user_id, role, content):
+    if not DATABASE_URL:
+        return
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO chat_logs (user_id, role, content) VALUES (%s, %s, %s)",
+                (user_id, role, content)
+            )
+    except Exception as e:
+        logger.error(f"Chat log save error: {e}")
+
+def load_chat_history(user_id):
+    if not DATABASE_URL:
+        return []
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT role, content FROM chat_logs WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+                (user_id, MAX_HISTORY)
+            )
+            rows = cur.fetchall()
+            return [{"role": r, "content": c} for r, c in reversed(rows)]
+    except Exception as e:
+        logger.error(f"Chat history load error: {e}")
+        return []
+
+def delete_chat_history(user_id):
+    if not DATABASE_URL:
+        return
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute("DELETE FROM chat_logs WHERE user_id=%s", (user_id,))
+    except Exception as e:
+        logger.error(f"Chat history delete error: {e}")
 
 def get_memos_for_prompt(user_id):
     memos = get_memos(user_id, 5)
@@ -392,6 +429,34 @@ def download_drive_file(file_id):
         return buf, name
     except Exception as e:
         logger.error(f"Drive download error: {e}")
+        return None, None
+
+def get_drive_text(file_id):
+    if not drive_service:
+        return None, None
+    try:
+        meta = drive_service.files().get(fileId=file_id, fields="name, mimeType").execute()
+        mime = meta.get("mimeType", "")
+        name = meta.get("name", "")
+        text_export_map = {
+            "application/vnd.google-apps.document": "text/plain",
+            "application/vnd.google-apps.spreadsheet": "text/csv",
+            "application/vnd.google-apps.presentation": "text/plain",
+        }
+        if mime not in text_export_map:
+            return name, None
+        export_mime = text_export_map[mime]
+        req = drive_service.files().export_media(fileId=file_id, mimeType=export_mime)
+        buf = io.BytesIO()
+        dl = MediaIoBaseDownload(buf, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        buf.seek(0)
+        text = buf.read().decode("utf-8", errors="ignore")
+        return name, text
+    except Exception as e:
+        logger.error(f"Drive text export error: {e}")
         return None, None
 
 def list_folder_contents(folder_id, max_results=50):
@@ -752,6 +817,7 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 [DRIVE_SEARCH:검색어]
 [DRIVE_LIST]
 [DRIVE_SEND:번호]
+[DRIVE_SUMMARY:번호]
 [EMAIL:주소|제목|본문]
 [EMAIL_WITH_FILE:주소|제목|본문|파일번호]
 [EMAIL_LAST_FILE:주소|제목|본문]
@@ -780,6 +846,10 @@ SYSTEM_PROMPT = """당신은 정진수 대표님의 전담 AI 비서입니다.
 번호 지정:
 "2번", "두번째" → 해당 번호로 처리
 결과가 1개뿐이면 → 바로 [DRIVE_SEND:1]
+
+요약 트리거:
+"요약해줘", "내용 알려줘", "읽어줘", "뭐야 이 파일" + 번호 → [DRIVE_SUMMARY:번호]
+  예) "3번 요약해줘" → [DRIVE_SUMMARY:3], "1번 내용 알려줘" → [DRIVE_SUMMARY:1]
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 🔄 반복 작업 규칙
@@ -1206,6 +1276,28 @@ async def ask_claude_simple(message):
             else:
                 return "잠시 서버가 바빠요. 다시 말씀해주시면 바로 답변드릴게요! 🙏"
 
+async def classify_email(sender, subject, snippet):
+    prompt = (
+        f"이메일을 분류해줘.\n보낸사람: {sender}\n제목: {subject}\n미리보기: {snippet}\n\n"
+        "반드시 아래 JSON 형식으로만 답해 (다른 텍스트 없이):\n"
+        '{"category": "important 또는 normal 또는 spam", "summary": "한줄요약"}\n\n'
+        "분류 기준:\n"
+        "- important: 거래처, 업무, 강의/출강, 개인 메일, 결제/정산, 계약\n"
+        "- normal: 뉴스레터, 서비스 안내, 일반 알림\n"
+        "- spam: 광고, 프로모션, 마케팅, 자동발송 홍보"
+    )
+    try:
+        r = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = r.content[0].text.strip()
+        return json.loads(text)
+    except Exception as e:
+        logger.error(f"Email classify error: {e}")
+        return {"category": "normal", "summary": subject[:30]}
+
 async def cmd_both(update, context):
     uid = update.effective_user.id
     if not is_authorized(uid):
@@ -1222,12 +1314,17 @@ async def cmd_both(update, context):
 
 async def ask_claude(user_id, message):
     history = conversation_history[user_id]
+    if not history:
+        history = load_chat_history(user_id)
+        conversation_history[user_id] = history
     memos = get_memos_for_prompt(user_id)
     system = SYSTEM_PROMPT + memos
 
-    history.append({"role": "user", "content": f"[현재 KST: {kst_now().strftime('%Y-%m-%d %H:%M')}]\n{message}"})
+    user_content = f"[현재 KST: {kst_now().strftime('%Y-%m-%d %H:%M')}]\n{message}"
+    history.append({"role": "user", "content": user_content})
     if len(history) > MAX_HISTORY:
         history[:] = history[-MAX_HISTORY:]
+    save_chat_log(user_id, "user", user_content)
     for attempt in range(2):
         try:
             r = await client.messages.create(
@@ -1239,6 +1336,7 @@ async def ask_claude(user_id, message):
             text_parts = [block.text for block in r.content if block.type == "text"]
             txt = "\n".join(text_parts) if text_parts else "응답 없음"
             history.append({"role": "assistant", "content": txt})
+            save_chat_log(user_id, "assistant", txt)
             return txt
         except Exception as e:
             logger.error(f"Claude error (attempt {attempt + 1}): {e}")
@@ -1278,16 +1376,30 @@ async def check_new_gmail(app):
             already_notified = {row[0] for row in cur.fetchall()}
             truly_new = [e for e in emails if e["id"] not in already_notified]
             for e in truly_new:
-                sender = e["from"].split("<")[0].strip()[:20]
-                subject = e["subject"][:30]
-                msg = f"📬 새 메일 왔어요!\n\n👤 {sender}\n📌 {subject}\n\n💡 '보여줘'라고 하면 바로 열어드려요"
-                for uid in ALLOWED_USER_IDS:
-                    user_notified_mail[uid] = e["id"]
-                    await app.bot.send_message(chat_id=uid, text=msg)
+                sender = e["from"].split("<")[0].strip()[:30]
+                subject = e["subject"][:50]
+                snippet = e.get("snippet", "")[:200]
+                result = await classify_email(sender, subject, snippet)
+                cat = result.get("category", "normal")
+                summary = result.get("summary", subject)
                 cur.execute(
                     "INSERT INTO notified_mail_ids (mail_id) VALUES (%s) ON CONFLICT DO NOTHING",
                     (e["id"],)
                 )
+                if cat == "spam":
+                    logger.info(f"Skipping spam mail: {subject}")
+                    continue
+                emoji = "🔴" if cat == "important" else "🟡"
+                msg = (
+                    f"{emoji} 새 메일\n\n"
+                    f"👤 {sender}\n"
+                    f"📌 {subject}\n"
+                    f"💡 {summary}\n\n"
+                    f"'보여줘'라고 하면 바로 열어드려요"
+                )
+                for uid in ALLOWED_USER_IDS:
+                    user_notified_mail[uid] = e["id"]
+                    await app.bot.send_message(chat_id=uid, text=msg)
             conn.commit()
         finally:
             cur.close()
@@ -1320,6 +1432,7 @@ async def cmd_clear(update, context):
     uid = update.effective_user.id
     if not is_authorized(uid): return
     conversation_history[uid].clear()
+    delete_chat_history(uid)
     user_search_results[uid].clear()
     user_gmail_list[uid].clear()
     user_last_action[uid].clear()
@@ -1566,6 +1679,17 @@ async def cmd_briefing(update, context):
     await update.message.reply_text("📰 뉴스 브리핑 시작합니다...")
     await send_news_briefing(context.application)
 
+_VOICE_CMD_KEYWORDS = [
+    "일정", "알림", "스케줄", "메일", "이메일", "뉴스", "메모",
+    "파일", "드라이브", "검색", "찾아", "보내", "보여", "확인",
+    "날씨", "브리핑", "요약",
+]
+
+def _is_voice_command(text):
+    if not text or len(text) > 50:
+        return False
+    return any(kw in text for kw in _VOICE_CMD_KEYWORDS)
+
 async def handle_voice(update, context):
     u = update.effective_user
     if not is_authorized(u.id): return
@@ -1596,10 +1720,15 @@ async def handle_voice(update, context):
         transcript = f"📝 텍스트:\n\n{txt}"
         for i in range(0, len(transcript), 4096):
             await update.message.reply_text(transcript[i:i+4096])
-        analysis = await ask_claude(u.id, f"다음 음성 내용을 분석하고 요약해줘:\n\n{txt}")
-        full = f"🔍 분석:\n\n{analysis}"
-        for i in range(0, len(full), 4096):
-            await update.message.reply_text(full[i:i+4096])
+        if _is_voice_command(txt):
+            await update.message.reply_text(f"⚡ 명령으로 처리합니다...")
+            context.user_data["_voice_text"] = txt
+            await handle_message(update, context)
+        else:
+            analysis = await ask_claude(u.id, f"다음 음성 내용을 분석하고 요약해줘:\n\n{txt}")
+            full = f"🔍 분석:\n\n{analysis}"
+            for i in range(0, len(full), 4096):
+                await update.message.reply_text(full[i:i+4096])
     else:
         await update.message.reply_text("❌ 음성 인식 실패")
 
@@ -1738,7 +1867,7 @@ async def handle_message(update, context):
         await update.message.reply_text("Access denied.")
         return
 
-    text = update.message.text or ""
+    text = update.message.text or context.user_data.pop("_voice_text", "") or ""
 
     # 이전 대화 맥락 유지: 메시지에 메일 주소가 보이면 항상 기억해 둔다 (나중에 "이거 메일로 보내줘"에 활용)
     _addr_now = EMAIL_RE.search(text)
@@ -2282,6 +2411,32 @@ async def handle_message(update, context):
         except Exception as e:
             logger.error(f"Drive send error: {e}")
             await update.message.reply_text("❌ 번호 확인 필요")
+
+    elif "[DRIVE_SUMMARY:" in resp:
+        try:
+            num = int(resp.split("[DRIVE_SUMMARY:")[1].split("]")[0]) - 1
+            files = user_search_results.get(u.id, [])
+            if 0 <= num < len(files):
+                fi = files[num]
+                await update.message.reply_text(f"📖 '{fi['name']}' 요약 중...")
+                loop = asyncio.get_running_loop()
+                name, text_content = await loop.run_in_executor(None, get_drive_text, fi["id"])
+                if text_content:
+                    truncated = text_content[:8000]
+                    summary = await ask_claude(u.id, f"다음 문서를 요약해줘. 문서 제목: {name}\n\n{truncated}")
+                    full = f"📄 '{name}' 요약:\n\n{summary}"
+                    for i in range(0, len(full), 4096):
+                        await update.message.reply_text(full[i:i+4096])
+                else:
+                    await update.message.reply_text(
+                        f"❌ '{fi['name']}'은(는) 텍스트 추출이 안 되는 형식이에요.\n"
+                        f"📤 대신 파일을 보내드릴까요? '보내줘'라고 해주세요!"
+                    )
+            else:
+                await update.message.reply_text("❌ 잘못된 번호")
+        except Exception as e:
+            logger.error(f"Drive summary error: {e}")
+            await update.message.reply_text("❌ 요약 실패")
 
     elif "[EMAIL_LAST_FILE:" in resp:
         try:
