@@ -1288,12 +1288,16 @@ async def classify_email(sender, subject, snippet):
     )
     try:
         r = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=200,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = r.content[0].text.strip()
-        return json.loads(text)
+        raw = r.content[0].text.strip()
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        data = json.loads(m.group(0) if m else raw)
+        if data.get("category") not in ("important", "normal", "spam"):
+            data["category"] = "normal"
+        return data
     except Exception as e:
         logger.error(f"Email classify error: {e}")
         return {"category": "normal", "summary": subject[:30]}
@@ -1324,7 +1328,6 @@ async def ask_claude(user_id, message):
     history.append({"role": "user", "content": user_content})
     if len(history) > MAX_HISTORY:
         history[:] = history[-MAX_HISTORY:]
-    save_chat_log(user_id, "user", user_content)
     for attempt in range(2):
         try:
             r = await client.messages.create(
@@ -1336,6 +1339,7 @@ async def ask_claude(user_id, message):
             text_parts = [block.text for block in r.content if block.type == "text"]
             txt = "\n".join(text_parts) if text_parts else "응답 없음"
             history.append({"role": "assistant", "content": txt})
+            save_chat_log(user_id, "user", user_content)
             save_chat_log(user_id, "assistant", txt)
             return txt
         except Exception as e:
@@ -1721,11 +1725,16 @@ async def handle_voice(update, context):
         for i in range(0, len(transcript), 4096):
             await update.message.reply_text(transcript[i:i+4096])
         if _is_voice_command(txt):
-            await update.message.reply_text(f"⚡ 명령으로 처리합니다...")
+            await update.message.reply_text("⚡ 명령으로 처리합니다...")
             context.user_data["_voice_text"] = txt
             await handle_message(update, context)
         else:
-            analysis = await ask_claude(u.id, f"다음 음성 내용을 분석하고 요약해줘:\n\n{txt}")
+            voice_text = txt[:3000]
+            r = await client.messages.create(
+                model="claude-sonnet-4-6", max_tokens=2048,
+                messages=[{"role": "user", "content": f"다음 음성 내용을 분석하고 요약해줘:\n\n{voice_text}"}],
+            )
+            analysis = r.content[0].text
             full = f"🔍 분석:\n\n{analysis}"
             for i in range(0, len(full), 4096):
                 await update.message.reply_text(full[i:i+4096])
@@ -1766,6 +1775,7 @@ async def handle_audio_file(update, context):
             await update.message.reply_text(f"📝 텍스트:\n\n{txt}")
         # 화자가 3명 이상으로 잡히면 회의록, 아니면 통화 요약
         speaker_labels = set(re.findall(r"\[화자([^\]]+)\]", txt))
+        audio_text = txt[:5000]
         if len(speaker_labels) >= 3:
             prompt = (
                 "여러 명이 참여한 회의 녹음입니다. 아래 화자 분리된 내용을 바탕으로 "
@@ -1774,11 +1784,15 @@ async def handle_audio_file(update, context):
                 "2) 화자별 주요 발언\n"
                 "3) 결정사항\n"
                 "4) 할 일 (담당자가 언급되면 함께)\n\n"
-                f"{txt}"
+                f"{audio_text}"
             )
         else:
-            prompt = f"통화/음성 녹음입니다. 핵심 요약하고 중요 포인트 정리해줘:\n\n{txt}"
-        analysis = await ask_claude(u.id, prompt)
+            prompt = f"통화/음성 녹음입니다. 핵심 요약하고 중요 포인트 정리해줘:\n\n{audio_text}"
+        r = await client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        analysis = r.content[0].text
         full = f"🔍 분석:\n\n{analysis}"
         for i in range(0, len(full), 4096):
             await update.message.reply_text(full[i:i+4096])
@@ -2422,8 +2436,12 @@ async def handle_message(update, context):
                 loop = asyncio.get_running_loop()
                 name, text_content = await loop.run_in_executor(None, get_drive_text, fi["id"])
                 if text_content:
-                    truncated = text_content[:8000]
-                    summary = await ask_claude(u.id, f"다음 문서를 요약해줘. 문서 제목: {name}\n\n{truncated}")
+                    truncated = text_content[:6000]
+                    r = await client.messages.create(
+                        model="claude-sonnet-4-6", max_tokens=2048,
+                        messages=[{"role": "user", "content": f"다음 문서를 핵심 위주로 요약해줘. 문서 제목: {name}\n\n{truncated}"}],
+                    )
+                    summary = r.content[0].text
                     full = f"📄 '{name}' 요약:\n\n{summary}"
                     for i in range(0, len(full), 4096):
                         await update.message.reply_text(full[i:i+4096])
