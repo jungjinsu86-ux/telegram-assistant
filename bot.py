@@ -1145,6 +1145,7 @@ def _has_send_intent(s):
 user_mail_offset = {}    # uid -> 다음 표시 시작 인덱스 (0-based)
 user_mail_token = {}     # uid -> nextPageToken (None이면 마지막 페이지)
 user_mail_query_store = {}  # uid -> 현재 페이지네이션 중인 Gmail 쿼리
+user_notified_mail = {}  # uid -> 마지막 알림 메일 ID (알림 후 "보여줘" 대응)
 
 _GPT_BOTH_SYSTEM = (
     "반드시 2025년 이후 최신 자료만 사용할 것. "
@@ -1279,8 +1280,9 @@ async def check_new_gmail(app):
             for e in truly_new:
                 sender = e["from"].split("<")[0].strip()[:20]
                 subject = e["subject"][:30]
-                msg = f"📬 새 메일 왔어요!\n\n👤 {sender}\n📌 {subject}"
+                msg = f"📬 새 메일 왔어요!\n\n👤 {sender}\n📌 {subject}\n\n💡 '보여줘'라고 하면 바로 열어드려요"
                 for uid in ALLOWED_USER_IDS:
+                    user_notified_mail[uid] = e["id"]
                     await app.bot.send_message(chat_id=uid, text=msg)
                 cur.execute(
                     "INSERT INTO notified_mail_ids (mail_id) VALUES (%s) ON CONFLICT DO NOTHING",
@@ -1752,6 +1754,33 @@ async def handle_message(update, context):
         )
     except Exception:
         pass
+
+    # ── 새 메일 알림 후 "보여줘" → 해당 메일 바로 열기
+    _show_words = ["보여", "봐", "열어", "읽어", "확인", "뭔데", "뭐야", "내용", "봐줘", "보자", "열려"]
+    if u.id in user_notified_mail and len(text) <= 20 and any(w in text for w in _show_words):
+        mail_id = user_notified_mail.pop(u.id)
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        content = get_gmail_content(mail_id)
+        if content:
+            user_mail_attachments[u.id] = {"msg_id": mail_id, "items": content.get("attachments_meta", [])}
+            user_last_mail[u.id] = {"from": content.get("from",""), "subject": content.get("subject",""), "body": content.get("body","")}
+            body_display = content.get("body_preview") or content.get("body", "")[:1000] or "본문 없음"
+            _att = content.get("attachments", [])
+            _att_str = ("\n📎 첨부파일:\n" + "\n".join(f"  • {a}" for a in _att)) if _att else ""
+            msg = (f"📧 메일 내용\n\n"
+                   f"👤 {content['from']}\n"
+                   f"📌 {content['subject']}\n"
+                   f"📅 {content['date']}{_att_str}\n\n"
+                   f"📝 내용:\n{body_display}")
+            for i in range(0, len(msg), 4096):
+                await update.message.reply_text(msg[i:i+4096])
+            summary = await ask_claude(u.id, f"이 메일 내용을 간단히 요약해줘:\n{content['body']}")
+            full_summary = f"🔍 요약: {summary}"
+            for i in range(0, len(full_summary), 4096):
+                await update.message.reply_text(full_summary[i:i+4096])
+        else:
+            await update.message.reply_text("❌ 메일을 여는 데 실패했어요. 다시 시도해주세요.")
+        return
 
     # 10분 초과 사진 TTL 정리
     if u.id in user_last_photo:
