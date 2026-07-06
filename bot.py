@@ -4,7 +4,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from contextlib import contextmanager
 from telegram import Update, ReactionTypeEmoji
@@ -48,7 +48,7 @@ MAX_HISTORY = 20
 BOTH_KEYWORDS = {"둘다", "둘 다", "너희둘", "너희 둘", "둘이", "둘의견", "둘다말해", "둘다얘기"}
 
 def kst_now():
-    return datetime.utcnow() + timedelta(hours=9)
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=9)
 
 # ── DB 초기화
 def get_db():
@@ -364,7 +364,8 @@ if GMAIL_REFRESH_TOKEN and GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET:
                 "https://www.googleapis.com/auth/gmail.modify",
             ],
         )
-        gmail_creds.refresh(Request())
+        if not gmail_creds.valid:
+            gmail_creds.refresh(Request())
         gmail_service = build("gmail", "v1", credentials=gmail_creds)
         logger.info("Gmail connected!")
     except Exception as e:
@@ -484,7 +485,8 @@ def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
         # 헤더 인젝션 방지: 받는주소/제목의 개행 제거
         to_addr = (to_addr or "").replace("\r", "").replace("\n", "").strip()
         subject = (subject or "").replace("\r", " ").replace("\n", " ").strip()
-        gmail_creds.refresh(Request())
+        if not gmail_creds.valid:
+            gmail_creds.refresh(Request())
         msg = MIMEMultipart()
         msg["From"] = GMAIL_ADDRESS
         msg["To"] = to_addr
@@ -513,7 +515,8 @@ def get_gmail_list(max_results=10, query="newer_than:30d", page_token=None):
     if not gmail_service or not gmail_creds:
         return [], None
     try:
-        gmail_creds.refresh(Request())
+        if not gmail_creds.valid:
+            gmail_creds.refresh(Request())
         params = {"userId": "me", "maxResults": max_results, "q": query}
         if page_token:
             params["pageToken"] = page_token
@@ -621,7 +624,8 @@ def get_gmail_content(msg_id):
     if not gmail_service or not gmail_creds:
         return None
     try:
-        gmail_creds.refresh(Request())
+        if not gmail_creds.valid:
+            gmail_creds.refresh(Request())
         msg = gmail_service.users().messages().get(
             userId="me", id=msg_id, format="full"
         ).execute()
@@ -666,7 +670,8 @@ def download_gmail_attachment(msg_id, att_id):
     if not gmail_service or not gmail_creds:
         return None
     try:
-        gmail_creds.refresh(Request())
+        if not gmail_creds.valid:
+            gmail_creds.refresh(Request())
         att = gmail_service.users().messages().attachments().get(
             userId="me", messageId=msg_id, id=att_id).execute()
         data = base64.urlsafe_b64decode(att["data"])
@@ -1366,7 +1371,7 @@ async def check_new_gmail(app):
     if not gmail_service or not ALLOWED_USER_IDS or not DATABASE_URL:
         return
     try:
-        emails, _ = get_gmail_list(10, "newer_than:1h")
+        emails, _ = get_gmail_list(10, "newer_than:2h")
         if not emails:
             return
         current_ids = [e["id"] for e in emails]
@@ -1832,7 +1837,7 @@ async def handle_photo(update, context):
             return
 
         # TTL과 함께 저장 (메모리 누수 방지)
-        user_last_photo[u.id] = {"b64": b64, "mime_type": mime_type, "ts": datetime.utcnow()}
+        user_last_photo[u.id] = {"b64": b64, "mime_type": mime_type, "ts": datetime.now(timezone.utc)}
 
         caption = (update.message.caption or "").strip()
         _cap = caption.replace(" ", "")
@@ -1927,7 +1932,7 @@ async def handle_message(update, context):
 
     # 10분 초과 사진 TTL 정리
     if u.id in user_last_photo:
-        age = (datetime.utcnow() - user_last_photo[u.id]["ts"]).total_seconds()
+        age = (datetime.now(timezone.utc) - user_last_photo[u.id]["ts"]).total_seconds()
         if age > 600:
             user_last_photo.pop(u.id)
 
@@ -2695,6 +2700,22 @@ async def handle_message(update, context):
         else:
             await update.message.reply_text(resp)
 
+async def on_error(update, context):
+    """예상 못 한 오류를 로그에 남기고, 가능하면 사용자에게 한 줄 안내."""
+    logger.error("Unhandled error", exc_info=context.error)
+    try:
+        chat_id = None
+        if isinstance(update, Update) and update.effective_chat:
+            chat_id = update.effective_chat.id
+        if chat_id is not None:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="죄송해요, 처리 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요."
+            )
+    except Exception:
+        pass
+
+
 def main():
     init_db()
 
@@ -2729,6 +2750,7 @@ def main():
         handle_audio_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info(f"Handlers registered: {len(app.handlers[0])}")
+    app.add_error_handler(on_error)
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_schedules, "interval", minutes=1, args=[app])
