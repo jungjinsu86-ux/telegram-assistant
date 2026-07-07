@@ -1763,7 +1763,7 @@ async def handle_voice(update, context):
                 model="claude-sonnet-4-6", max_tokens=2048,
                 messages=[{"role": "user", "content": f"다음 음성 내용을 분석하고 요약해줘:\n\n{voice_text}"}],
             )
-            analysis = r.content[0].text
+            analysis = "".join(b.text for b in r.content if b.type == "text") or "요약을 만들지 못했어요."
             full = f"🔍 분석:\n\n{analysis}"
             for i in range(0, len(full), 4096):
                 await update.message.reply_text(full[i:i+4096])
@@ -1821,7 +1821,7 @@ async def handle_audio_file(update, context):
             model="claude-sonnet-4-6", max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
         )
-        analysis = r.content[0].text
+        analysis = "".join(b.text for b in r.content if b.type == "text") or "요약을 만들지 못했어요."
         full = f"🔍 분석:\n\n{analysis}"
         for i in range(0, len(full), 4096):
             await update.message.reply_text(full[i:i+4096])
@@ -2635,6 +2635,8 @@ async def handle_message(update, context):
             uid = u.id
             query = user_mail_query_store.get(uid, "newer_than:30d")
             start = user_mail_offset.get(uid, 0)
+            if start >= n:  # 이미 그 이상 봤는데 작은 번호를 말하면 → 처음부터 다시 보여줌
+                start = 0
             emails = _fetch_until(uid, n, query)
             page = emails[start:n]
             if not page:
