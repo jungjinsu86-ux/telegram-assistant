@@ -164,11 +164,21 @@ def load_chat_history(user_id):
     try:
         with db_cursor() as cur:
             cur.execute(
-                "SELECT role, content FROM chat_logs WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+                "SELECT role, content FROM chat_logs WHERE user_id=%s ORDER BY created_at DESC, id DESC LIMIT %s",
                 (user_id, MAX_HISTORY)
             )
             rows = cur.fetchall()
-            return [{"role": r, "content": c} for r, c in reversed(rows)]
+        raw = [{"role": r, "content": c} for r, c in reversed(rows)]
+        # 안전장치: 반드시 user로 시작하고 user/assistant가 번갈아 나오도록 정리.
+        # (저장이 반쯤 실패하거나 순서가 꼬여도 Claude API 오류로 봇이 멈추지 않게)
+        clean, expect = [], "user"
+        for m in raw:
+            if m["role"] == expect:
+                clean.append(m)
+                expect = "assistant" if expect == "user" else "user"
+        if clean and clean[-1]["role"] == "user":
+            clean.pop()  # 짝(답변) 없는 마지막 user 제거
+        return clean
     except Exception as e:
         logger.error(f"Chat history load error: {e}")
         return []
@@ -1391,12 +1401,13 @@ async def check_new_gmail(app):
                 result = await classify_email(sender, subject, snippet)
                 cat = result.get("category", "normal")
                 summary = result.get("summary", subject)
-                cur.execute(
-                    "INSERT INTO notified_mail_ids (mail_id) VALUES (%s) ON CONFLICT DO NOTHING",
-                    (e["id"],)
-                )
                 if cat == "spam":
                     logger.info(f"Skipping spam mail: {subject}")
+                    cur.execute(
+                        "INSERT INTO notified_mail_ids (mail_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                        (e["id"],)
+                    )
+                    conn.commit()
                     continue
                 emoji = "🔴" if cat == "important" else "🟡"
                 msg = (
@@ -1406,10 +1417,23 @@ async def check_new_gmail(app):
                     f"💡 {summary}\n\n"
                     f"'보여줘'라고 하면 바로 열어드려요"
                 )
-                for uid in ALLOWED_USER_IDS:
-                    user_notified_mail[uid] = e["id"]
-                    await app.bot.send_message(chat_id=uid, text=msg)
-            conn.commit()
+                try:
+                    for uid in ALLOWED_USER_IDS:
+                        user_notified_mail[uid] = e["id"]
+                        await app.bot.send_message(chat_id=uid, text=msg)
+                    # 발송 성공한 메일만 '알림함' 기록 → 중간에 하나 실패해도 나머지엔 영향 없음
+                    cur.execute(
+                        "INSERT INTO notified_mail_ids (mail_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                        (e["id"],)
+                    )
+                    conn.commit()
+                except Exception as send_err:
+                    logger.error(f"Mail notify send failed ({e['id']}): {send_err}")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    # 발송 실패 → 기록 안 함 → 다음 주기에 자동 재시도
         finally:
             cur.close()
             conn.close()
