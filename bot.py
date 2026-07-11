@@ -2442,18 +2442,35 @@ async def handle_message(update, context):
                     )
                     return
                 await update.message.reply_text(f"📤 '{fi['name']}' 전송 중...")
-                buf, name = download_drive_file(fi["id"])
-                if buf:
+                loop = asyncio.get_running_loop()
+                buf, name = await loop.run_in_executor(None, download_drive_file, fi["id"])
+                if not buf:
+                    await update.message.reply_text(
+                        "❌ 파일을 내려받지 못했어요. (드라이브 접근 권한이나 파일 형식을 확인해주세요)"
+                    )
+                    return
+                size_mb = buf.getbuffer().nbytes / (1024 * 1024)
+                if size_mb > 49:
+                    await update.message.reply_text(
+                        f"⚠️ '{name}' 파일이 너무 커요 ({size_mb:.0f}MB).\n"
+                        f"텔레그램 봇은 50MB까지만 보낼 수 있어요."
+                    )
+                    return
+                try:
                     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
-                    await update.message.reply_document(document=buf, filename=name, caption=f"📄 {name}")
+                    await update.message.reply_document(
+                        document=buf, filename=name, caption=f"📄 {name}",
+                        read_timeout=120, write_timeout=120,
+                    )
                     user_last_action[u.id] = {"type": "file", "file_id": fi["id"], "name": name}
-                else:
-                    await update.message.reply_text("❌ 다운로드 실패")
+                except Exception as send_err:
+                    logger.error(f"reply_document failed ({name}): {send_err}")
+                    await update.message.reply_text(f"❌ 파일 전송 중 오류가 났어요.\n({send_err})")
             else:
-                await update.message.reply_text("❌ 잘못된 번호")
+                await update.message.reply_text("❌ 잘못된 번호예요. 목록에 있는 번호로 다시 말씀해주세요.")
         except Exception as e:
             logger.error(f"Drive send error: {e}")
-            await update.message.reply_text("❌ 번호 확인 필요")
+            await update.message.reply_text(f"❌ 파일 처리 중 문제가 생겼어요.\n({e})")
 
     elif "[DRIVE_SUMMARY:" in resp:
         try:
