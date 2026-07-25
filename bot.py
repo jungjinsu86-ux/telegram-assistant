@@ -16,7 +16,7 @@ from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 import psycopg2
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -504,8 +504,11 @@ def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
         msg.attach(MIMEText(body, "plain", "utf-8"))
         if attach_buf and attach_name:
             attach_buf.seek(0)
+            data = attach_buf.read()
+            if len(data) > 25 * 1024 * 1024:
+                return False, "첨부파일이 25MB를 넘어 메일로 보낼 수 없어요."
             part = MIMEBase("application", "octet-stream")
-            part.set_payload(attach_buf.read())
+            part.set_payload(data)
             encoders.encode_base64(part)
             part.add_header(
                 "Content-Disposition",
@@ -513,8 +516,12 @@ def send_gmail(to_addr, subject, body, attach_buf=None, attach_name=None):
                 filename=("utf-8", "", attach_name)
             )
             msg.attach(part)
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-        gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
+            # 첨부가 있으면 미디어 업로드(업로드 전용 엔드포인트)로 전송 → 큰 파일 Broken pipe 방지
+            media = MediaIoBaseUpload(io.BytesIO(msg.as_bytes()), mimetype="message/rfc822")
+            gmail_service.users().messages().send(userId="me", body={}, media_body=media).execute()
+        else:
+            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+            gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
         return True, "OK"
     except Exception as e:
         logger.error(f"Gmail send error: {e}")
@@ -2124,7 +2131,8 @@ async def handle_message(update, context):
     # ── "첨부파일 보내줘/다운로드" → 마지막에 연 메일의 첨부파일 전송
     _tt = text.replace(" ", "")
     _email_send_intent = ("@" in text) or ("이메일로" in _tt) or ("메일로" in _tt) or bool(re.search(r"(한테|에게)", text))
-    if any(k in _tt for k in ["첨부", "파일", "첨부파일"]) and any(w in _tt for w in ["보내", "전송", "다운", "받", "줘", "내려", "달라", "줄래", "주라", "쏴", "보내줘", "전달", "넘겨", "가져", "다운로드", "내려받", "받을래", "받고싶"]) and not _email_send_intent:
+    _drive_intent = ("드라이브" in _tt) or ("목록" in _tt)  # 드라이브/목록 요청은 메일 첨부 명령이 아님
+    if any(k in _tt for k in ["첨부", "파일", "첨부파일"]) and any(w in _tt for w in ["보내", "전송", "다운", "받", "줘", "내려", "달라", "줄래", "주라", "쏴", "보내줘", "전달", "넘겨", "가져", "다운로드", "내려받", "받을래", "받고싶"]) and not _email_send_intent and not _drive_intent:
         info = user_mail_attachments.get(u.id) or {}
         items = info.get("items", [])
         if items:
