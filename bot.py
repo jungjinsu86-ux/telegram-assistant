@@ -1298,6 +1298,23 @@ async def ask_claude_simple(message):
             else:
                 return "잠시 서버가 바빠요. 다시 말씀해주시면 바로 답변드릴게요! 🙏"
 
+def _ai_error_hint(e):
+    """Claude API 오류를 알아보기 쉬운 한국어 안내로 바꿔준다."""
+    s = str(e).lower()
+    if any(k in s for k in ["credit", "billing", "insufficient", "quota", "payment"]):
+        return "AI 크레딧(잔액)이 부족해요. console.anthropic.com → Billing 에서 충전이 필요해요 💳"
+    if any(k in s for k in ["authentication", "invalid x-api-key", "invalid api key", "401", "unauthorized"]):
+        return "AI 키가 잘못됐거나 만료됐어요. ANTHROPIC_API_KEY를 확인해주세요 🔑"
+    if any(k in s for k in ["permission", "403"]):
+        return "AI 키에 권한이 없어요. 키 설정을 확인해주세요."
+    if any(k in s for k in ["rate limit", "429"]):
+        return "요청이 너무 몰렸어요. 잠시 후 다시 시도해주세요."
+    if any(k in s for k in ["overloaded", "529"]):
+        return "AI 서버가 혼잡해요. 잠시 후 다시 시도해주세요."
+    if any(k in s for k in ["not_found", "404"]):
+        return "AI 모델 이름이 잘못됐어요. 모델 설정 확인이 필요해요."
+    return f"AI 호출 실패: {str(e)[:200]}"
+
 async def classify_email(sender, subject, snippet):
     prompt = (
         f"이메일을 분류해줘.\n보낸사람: {sender}\n제목: {subject}\n미리보기: {snippet}\n\n"
@@ -1371,7 +1388,7 @@ async def ask_claude(user_id, message):
             else:
                 if history and history[-1]["role"] == "user":
                     history.pop()
-                return "잠시 서버가 바빠요. 다시 말씀해주시면 바로 답변드릴게요! 🙏"
+                return f"⚠️ {_ai_error_hint(e)}"
 
 # ── 알림 체크 (1분마다)
 async def check_schedules(app):
@@ -1456,10 +1473,21 @@ async def cmd_start(update, context):
     g = "✅" if gmail_service else "❌"
     s = "✅" if clova_available else "❌"
     db = "✅" if DATABASE_URL else "❌"
+    # AI(Claude)는 실제로 한 번 호출해서 진짜 되는지 확인 (아주 짧게)
+    ai, ai_note = "✅", ""
+    try:
+        await client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=5,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+    except Exception as e:
+        logger.error(f"AI health check failed: {e}")
+        ai = "❌"
+        ai_note = f"\n\n⚠️ AI 문제: {_ai_error_hint(e)}"
     await update.message.reply_text(
         f"안녕하세요! 👋\n\n"
-        f"📁 Drive: {d}  📧 Gmail: {g}  🎙️ 음성: {s}\n"
-        f"🔍 웹검색: ✅  🗄️ DB: {db}\n\n"
+        f"🤖 AI: {ai}  📁 Drive: {d}  📧 Gmail: {g}\n"
+        f"🎙️ 음성: {s}  🗄️ DB: {db}{ai_note}\n\n"
         f"/files - 파일 목록\n"
         f"/mail - 받은 메일\n"
         f"/memo [내용] - 메모 저장\n"
@@ -1688,7 +1716,7 @@ async def _search_one_keyword(kw):
         return kw, "\n".join(text_parts) if text_parts else "검색 결과 없음"
     except Exception as e:
         logger.error(f"News search error for '{kw}': {e}")
-        return kw, "검색 실패"
+        return kw, f"검색 실패 — {_ai_error_hint(e)}"
 
 async def send_news_briefing(app):
     if not ALLOWED_USER_IDS or not DATABASE_URL:
